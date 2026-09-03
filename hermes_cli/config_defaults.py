@@ -4623,6 +4623,14 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "PERPLEXITY_API_KEY": {
+        "description": "Perplexity API key for the Search API web backend (ranked results + query-relevant page snippets)",
+        "prompt": "Perplexity API key",
+        "url": "https://www.perplexity.ai/account/api",
+        "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
+    },
     "KEENABLE_API_KEY": {
         "description": "Keenable API key for fast independent-index web search and page fetch (optional — keyless free tier works without it)",
         "prompt": "Keenable API key",

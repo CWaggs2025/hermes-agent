@@ -506,6 +506,7 @@ def get_nous_subscription_features(
     direct_firecrawl = bool(get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL"))
     direct_parallel = bool(get_env_value("PARALLEL_API_KEY"))
     direct_tavily = bool(get_env_value("TAVILY_API_KEY"))
+    direct_perplexity = bool(get_env_value("PERPLEXITY_API_KEY"))
     # Keyless Tavily is opt-in: selecting it in `hermes tools` / setup writes
     # web.backend (or a per-capability override) without requiring a key.
     tavily_selected = "tavily" in {web_backend, web_search_backend, web_extract_backend}
@@ -541,6 +542,7 @@ def get_nous_subscription_features(
         direct_exa = False
         direct_parallel = False
         direct_tavily = False
+        direct_perplexity = False
         tavily_selected = False
     if image_use_gateway:
         direct_fal = False
@@ -640,6 +642,7 @@ def get_nous_subscription_features(
             or (web_backend == "firecrawl" and direct_firecrawl)
             or (web_backend == "parallel" and direct_parallel)
             or (web_backend == "tavily" and tavily_ready)
+            or (web_backend == "perplexity" and direct_perplexity)
             or (web_backend == "searxng" and direct_searxng)
             # Per-capability overrides: search_backend or extract_backend may be set
             # without web.backend (using the new split config from #20061)
@@ -649,6 +652,8 @@ def get_nous_subscription_features(
             or (web_search_backend == "parallel" and direct_parallel)
             or (web_search_backend == "tavily" and tavily_ready)
             or (web_extract_backend == "tavily" and tavily_ready)
+            or (web_search_backend == "perplexity" and direct_perplexity)
+            or (web_extract_backend == "perplexity" and direct_perplexity)
         )
     )
     web_available = bool(
@@ -657,6 +662,7 @@ def get_nous_subscription_features(
         or direct_firecrawl
         or direct_parallel
         or tavily_ready
+        or direct_perplexity
         or direct_searxng
     )
 
@@ -901,6 +907,7 @@ def apply_nous_managed_defaults(
     if "web" in selected_toolsets and not features.web.explicit_configured and not (
         get_env_value("PARALLEL_API_KEY")
         or get_env_value("TAVILY_API_KEY")
+        or get_env_value("PERPLEXITY_API_KEY")
         or get_env_value("FIRECRAWL_API_KEY")
         or get_env_value("FIRECRAWL_API_URL")
     ):
@@ -999,6 +1006,7 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
             or get_env_value("FIRECRAWL_API_URL")
             or get_env_value("PARALLEL_API_KEY")
             or get_env_value("TAVILY_API_KEY")
+            or get_env_value("PERPLEXITY_API_KEY")
             or get_env_value("EXA_API_KEY")
             # Env-configured keyless local backend: a reachable self-hosted
             # SearXNG is a working web setup even with no stored selection
@@ -1034,7 +1042,7 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
 
 
 _GATEWAY_DIRECT_LABELS = {
-    "web": "Firecrawl/Exa/Parallel/Keenable key or SearXNG",
+    "web": "Firecrawl/Exa/Parallel/Tavily/Perplexity/Keenable key or SearXNG",
     "image_gen": "FAL key",
     "video_gen": "FAL key",
     "tts": "OpenAI/ElevenLabs key",

@@ -389,6 +389,7 @@ def run_dump(args):
         ("KILOCODE_API_KEY", "kilocode"),
         ("FIRECRAWL_API_KEY", "firecrawl"),
         ("TAVILY_API_KEY", "tavily"),
+        ("PERPLEXITY_API_KEY", "perplexity"),
         ("KEENABLE_API_KEY", "keenable"),
         ("BROWSERBASE_API_KEY", "browserbase"),
         ("FAL_KEY", "fal"),

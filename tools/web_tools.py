@@ -16,6 +16,7 @@ Backend compatibility:
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract; keyed or opt-in keyless)
+- Perplexity: https://docs.perplexity.ai (search, extract as query-relevant snippets; keyed only)
 
 LLM Processing:
 - Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
@@ -169,7 +170,7 @@ def _load_web_config() -> dict:
 # WebSearchProvider. Keep the two sets aligned by hand: if xai ever ships as
 # a registered provider, drop it here so the registry path takes over.
 _LEGACY_WEB_BACKENDS = frozenset(
-    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "keenable"}
+    {"parallel", "firecrawl", "tavily", "perplexity", "exa", "searxng", "brave-free", "ddgs", "xai", "keenable"}
 )
 
 
@@ -260,6 +261,7 @@ def _get_backend() -> str:
     # without falling back). Free-tier backends trail the paid ones.
     backend_candidates = (
         ("tavily", _has_env("TAVILY_API_KEY")),
+        ("perplexity", _has_env("PERPLEXITY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("keenable", _has_env("KEENABLE_API_KEY")),
@@ -394,6 +396,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY") or _tavily_explicitly_configured()
+    if backend == "perplexity":
+        return _has_env("PERPLEXITY_API_KEY")
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
@@ -604,6 +608,7 @@ def _web_requires_env() -> list[str]:
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
+        "PERPLEXITY_API_KEY",
         "KEENABLE_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
@@ -1192,7 +1197,7 @@ async def web_extract_tool(
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
                                 "Set web.extract_backend to firecrawl, "
-                                "tavily, keenable, exa, or parallel."
+                                "tavily, perplexity, keenable, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
@@ -1255,7 +1260,7 @@ async def web_extract_tool(
                             "error": (
                                 "No web extract provider configured. "
                                 "Set web.extract_backend to firecrawl, "
-                                "tavily, keenable, exa, or parallel."
+                                "tavily, perplexity, keenable, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
@@ -1610,7 +1615,7 @@ if __name__ == "__main__":
     else:
         print("❌ No web search backend configured")
         print(
-            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, KEENABLE_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
+            "Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, PERPLEXITY_API_KEY, KEENABLE_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL"
             f"{_firecrawl_backend_help_suffix()}"
         )
 
