@@ -9583,6 +9583,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Fail-awake, and called ONLY after a clean go_dormant().
         """
         from gateway.scale_to_zero import (
+            FLY_FREEZE_GRACE_S,
             brokered_sleep_url,
             request_brokered_suspend,
             self_suspend_available,
@@ -9593,10 +9594,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self_suspend_available():
                 accepted = await asyncio.to_thread(suspend_self)
                 lever = "self-suspend"
-                # Returns only after the freeze AND resume, so this IS the
-                # post-resume release: no waiting out the ceiling. A refusal froze
-                # nothing, so that path un-quiesces instead.
                 if accepted:
+                    # flaps answers BEFORE the kernel freezes, so the fence has to
+                    # span that gap. If the freeze lands we never resume this
+                    # sleep; if it does not, what is left of it runs after the
+                    # resume and releases then.
+                    await asyncio.sleep(FLY_FREEZE_GRACE_S)
                     self._scale_to_zero_hold_redial(False)
                 else:
                     self._scale_to_zero_abandon_suspend()
@@ -9637,12 +9640,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _scale_to_zero_abandon_suspend(self) -> None:
         """Undo a quiesce we are not going to follow with a suspend.
 
-        Both halves together: a released supervisor that still advertises
-        `draining` reads as mid-shutdown forever, since only a real inbound event
-        restores `running`.
+        All three together: a released supervisor still advertising `draining`
+        reads as mid-shutdown until the next real inbound event, and an abort
+        that skips the cooldown re-runs on every tick.
         """
         self._scale_to_zero_hold_redial(False)
-        self._scale_to_zero_mark_status("running")
+        # Same guard as _exit_external_drain: a real shutdown drain must win, so
+        # never resurrect a stopping gateway to `running`.
+        if not getattr(self, "_draining", False) and self._running:
+            self._scale_to_zero_mark_status("running")
+        # An abort before the cooldown is set would otherwise retry every tick.
+        self._scale_to_zero_cooldown_until = max(
+            self._scale_to_zero_cooldown_until, time.time() + 60.0
+        )
 
     def _scale_to_zero_hold_redial(self, held: bool) -> bool:
         """Hold or release the relay's reconnect supervisor. Returns whether the

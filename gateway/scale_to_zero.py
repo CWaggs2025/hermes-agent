@@ -66,6 +66,8 @@ FLY_API_SOCKET = "/.fly/api"
 # its own signed credential in the query string, like GATEWAY_RELAY_WAKE_URL.
 SLEEP_URL_ENV = "GATEWAY_RELAY_SLEEP_URL"
 
+_malformed_sleep_url_logged = False
+
 
 # config.yaml default (D2). Behavioural setting -> config, not env.
 # 2 minutes: with the gateway owning the suspend (idle predicate covers agent
@@ -197,10 +199,16 @@ def brokered_sleep_url(environ: Optional[dict] = None) -> Optional[str]:
         return None
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or not parsed.netloc:
-        logger.warning(
-            "scale-to-zero: ignoring malformed %s (want an absolute https URL)",
-            SLEEP_URL_ENV,
-        )
+        # Once per process: the watcher calls this every idle tick, and its own
+        # no-lever latch sits AFTER this, so an unlatched warning here would
+        # repeat for the life of a misconfigured deployment.
+        global _malformed_sleep_url_logged
+        if not _malformed_sleep_url_logged:
+            _malformed_sleep_url_logged = True
+            logger.warning(
+                "scale-to-zero: ignoring malformed %s (want an absolute https URL)",
+                SLEEP_URL_ENV,
+            )
         return None
     return url
 
@@ -218,6 +226,13 @@ def suspend_available(environ: Optional[dict] = None) -> bool:
 # or we give up while it is still working: the redial hold would be released, the
 # re-dial would clear the flip, and its stop would then land on a live destination.
 BROKERED_SUSPEND_TIMEOUT_S = 40.0
+
+# Flaps answers a suspend BEFORE the kernel freezes (suspend_self is documented
+# fire-and-forget), so the re-dial fence has to outlive the 2xx by this much or a
+# re-dial can restore a live destination in the gap. Kept short because the
+# freeze also stops the timer: whatever is left of it is the post-resume delay
+# before the gateway re-dials to drain.
+FLY_FREEZE_GRACE_S = 5.0
 
 
 def request_brokered_suspend(

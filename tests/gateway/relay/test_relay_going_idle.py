@@ -285,7 +285,8 @@ def test_adapter_reports_false_when_the_transport_hold_fails():
 
 @pytest.mark.asyncio
 async def test_adapter_redial_hold_delegates_to_transport(server):
-    """The runner only holds the adapter, so this delegation is the…"""
+    """The runner only holds the adapter, so this delegation is the only thing
+    wiring its suspend decision to the transport."""
     from gateway.config import PlatformConfig
     from gateway.relay.adapter import RelayAdapter
 

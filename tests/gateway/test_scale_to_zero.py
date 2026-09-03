@@ -206,6 +206,19 @@ def test_brokered_sleep_url_reads_the_stamp():
     assert brokered_sleep_url({SLEEP_URL_ENV: "   "}) is None
 
 
+def test_malformed_sleep_url_warns_once_not_every_idle_tick(monkeypatch, caplog):
+    """The watcher calls this on every tick and its own no-lever latch sits after
+    it, so an unlatched warning would repeat for the life of the process."""
+    import gateway.scale_to_zero as sz
+
+    monkeypatch.setattr(sz, "_malformed_sleep_url_logged", False)
+    monkeypatch.setenv("GATEWAY_RELAY_SLEEP_URL", "http://portal.example.com/x")
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            assert sz.brokered_sleep_url() is None
+    assert sum("ignoring malformed" in r.message for r in caplog.records) == 1
+
+
 def test_brokered_sleep_url_rejects_a_malformed_stamp(monkeypatch):
     """Validated before it is treated as a lever: otherwise the watcher marks draining, holds the re-dial and flips the connector, and only then does urllib reject the value, quiescing for a suspend that could never happen."""
     from gateway.scale_to_zero import brokered_sleep_url

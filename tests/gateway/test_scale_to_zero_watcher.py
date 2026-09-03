@@ -10,6 +10,7 @@ respects the cooldown, and skips when busy — the F7/D3 + D12 behaviour.
 
 from __future__ import annotations
 
+import contextlib
 import asyncio
 import time
 
@@ -58,6 +59,7 @@ def _runner_with(
     brokered=False,
     ack=True,
     idle_readings=None,
+    draining=False,
 ):
     """Build a GatewayRunner without booting it, stubbing just what the watcher
     touches. Real methods (_scale_to_zero_is_idle composition, the watcher body)
@@ -70,6 +72,7 @@ def _runner_with(
     """
     r = GatewayRunner.__new__(GatewayRunner)
     r._running = True
+    r._draining = draining
     r._scale_to_zero_cooldown_until = 0.0
     r._scale_to_zero_no_suspend_logged = False
     r._last_inbound_at = time.time()
@@ -135,7 +138,8 @@ async def test_watcher_does_not_quiesce_when_no_suspend_lever_exists(
 @pytest.mark.parametrize(
     "lever,kwargs,redial",
     [
-        # Fly releases once suspend_self returns, which is after the resume.
+        # Fly holds past the 2xx (flaps answers before the freeze) and releases
+        # once the gap closes; the gap itself is covered separately below.
         ("in-guest", {"can_self_suspend": True}, ["hold", "release"]),
         # The brokered stop is still in flight, so the hold stays.
         ("brokered", {"brokered": True}, ["hold"]),
@@ -150,6 +154,8 @@ async def test_watcher_quiesces_then_suspends_on_either_lever(
     monkeypatch.setattr(
         "gateway.scale_to_zero.request_brokered_suspend", lambda *a, **k: True
     )
+    # Not what this test is about; the freeze gap has its own case below.
+    monkeypatch.setattr("gateway.scale_to_zero.FLY_FREEZE_GRACE_S", 0.0)
 
     await _run_one_iteration(r, settle=0.15)
 
@@ -196,7 +202,8 @@ async def test_self_suspend_picks_a_lever_and_releases_only_when_nothing_will_fr
 
 @pytest.mark.asyncio
 async def test_watcher_honours_a_false_hold_from_the_adapter(monkeypatch):
-    """The hold is the invariant, not a nicety: quiescing without it…"""
+    """Quiescing without the hold leaves the re-dial free to clear the flip
+    mid-suspend, so a False from the adapter must stop the attempt."""
     r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
     adapter.hold_redial = lambda: False
     suspends = []
@@ -249,6 +256,56 @@ async def test_watcher_abandons_cleanly_when_it_must_not_suspend(
     assert suspends == [], case
     assert adapter.redial[-1] == "release", case
     assert r.states[:2] == ["draining", "running"], case
+
+@pytest.mark.asyncio
+async def test_in_guest_release_waits_for_the_freeze_gap(monkeypatch):
+    """flaps answers before the kernel freezes, so the fence spans that gap. A
+    machine that never froze must still get its supervisor back."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=True)
+    monkeypatch.setattr("gateway.scale_to_zero.suspend_self", lambda *a, **k: True)
+    monkeypatch.setattr("gateway.scale_to_zero.FLY_FREEZE_GRACE_S", 0.0)
+
+    await _run_one_iteration(r, settle=0.15)
+
+    assert adapter.redial == ["hold", "release"]
+
+
+@pytest.mark.asyncio
+async def test_in_guest_fence_still_held_inside_the_freeze_gap(monkeypatch):
+    """Observed mid-gap: flaps has answered but the freeze has not landed, so the
+    supervisor must still be parked."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=True)
+    monkeypatch.setattr("gateway.scale_to_zero.suspend_self", lambda *a, **k: True)
+    monkeypatch.setattr("gateway.scale_to_zero.FLY_FREEZE_GRACE_S", 5.0)
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.15)
+    assert adapter.redial == ["hold"], "released before the freeze could land"
+    r._running = False
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_abort_sets_a_cooldown_so_it_does_not_retry_every_tick(monkeypatch):
+    r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
+    adapter.hold_redial = lambda: False
+
+    await _run_one_iteration(r)
+
+    assert r._scale_to_zero_cooldown_until > time.time()
+
+
+@pytest.mark.asyncio
+async def test_abort_never_resurrects_a_shutting_down_gateway(monkeypatch):
+    """A real shutdown drain must win: `running` here would clobber it."""
+    r, _ = _runner_with(monkeypatch, idle=True, brokered=True, ack=False, draining=True)
+
+    await _run_one_iteration(r)
+
+    assert "running" not in r.states
+
 
 @pytest.mark.asyncio
 async def test_watcher_holds_redial_before_going_dormant(monkeypatch):
