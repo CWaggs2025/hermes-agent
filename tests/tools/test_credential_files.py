@@ -152,6 +152,78 @@ class TestSkillsDirectoryMount:
 
         assert mounts[0]["host_path"] == str(skills_dir)
 
+    def test_gateway_snapshot_is_never_exported_by_path(self, tmp_path, caplog):
+        """Sandbox consumers never receive a capability-stripped cache path.
+
+        Backends stringify and may lazily consume mount/upload paths, so no
+        reliable stage lifetime can be carried through their existing APIs.
+        Gateway snapshot support files remain available through skill_view;
+        sandbox path export fails closed.
+        """
+        from agent import skill_utils
+        import tools.credential_files as credential_files
+        import tools.skills_sync as skills_sync
+
+        hermes_home = tmp_path / "hermes"
+        roots = (str(tmp_path / "external"),)
+        fingerprint = skills_sync._external_catalog_fingerprint(roots)
+        generation = (
+            hermes_home
+            / "cache"
+            / "external-skills-snapshots"
+            / fingerprint
+            / "generation"
+        )
+        skill_file = generation / "root-0000" / "example" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text("LOCAL SNAPSHOT\n", encoding="utf-8")
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+            skills_sync._write_external_snapshot_complete_marker(
+                generation,
+                fingerprint=fingerprint,
+                scan_id="generation",
+                materialized_bytes=15,
+            )
+            skills_sync._publish_external_catalog_snapshot(
+                fingerprint,
+                roots,
+                {"example"},
+                (f"{fingerprint}/generation/root-0000",),
+            )
+        snapshot = skill_utils.get_gateway_external_skills_snapshot(
+            roots,
+            hermes_home=hermes_home,
+        )
+        assert snapshot is not None
+        guarded_root = snapshot[1][0]
+        profile_home = tmp_path / "empty-profile"
+        profile_home.mkdir()
+
+        with patch.object(
+            credential_files,
+            "_resolve_hermes_home",
+            return_value=profile_home,
+        ), patch(
+            "agent.skill_utils.get_external_skills_dirs",
+            return_value=[guarded_root],
+        ), patch(
+            "agent.skill_utils.get_project_skills_dirs",
+            return_value=[],
+        ):
+            mounts = get_skills_directory_mount()
+            uploaded = iter_skills_files()
+            repeated_mounts = get_skills_directory_mount()
+
+        assert mounts == []
+        assert repeated_mounts == []
+        assert uploaded == []
+        assert str(guarded_root) not in {
+            entry.get("host_path")
+            for entry in (*mounts, *repeated_mounts, *uploaded)
+        }
+        assert "will not be exported to a sandbox" in caplog.text
+        assert "will not be uploaded to a sandbox" in caplog.text
+
 
 class TestIterSkillsFiles:
     def test_returns_files_skipping_symlinks(self, tmp_path):

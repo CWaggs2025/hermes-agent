@@ -1,9 +1,11 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
+import stat
 from contextlib import contextmanager
 from contextvars import copy_context
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -743,6 +745,438 @@ class TestExternalSkillMutations:
     caused agents to create duplicate copies in ~/.hermes/skills/ as a
     workaround.
     """
+
+    def test_create_refuses_gateway_materialized_snapshot_target(
+        self, tmp_path, monkeypatch
+    ):
+        """A misconfigured create_dir cannot turn the snapshot into source."""
+        hermes_home = tmp_path / "hermes"
+        local = hermes_home / "skills"
+        snapshot_root = (
+            hermes_home
+            / "cache"
+            / "external-skills-snapshots"
+            / "roots-fingerprint"
+            / "generation-id"
+            / "root-0000"
+        )
+        local.mkdir(parents=True)
+        snapshot_root.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        content = VALID_SKILL_CONTENT.replace("test-skill", "new-skill")
+
+        with _two_roots(local, snapshot_root), patch(
+            "agent.skill_utils.get_skill_create_dir",
+            return_value=snapshot_root,
+        ):
+            result = _create_skill("new-skill", content)
+
+        assert result["success"] is False
+        assert "read-only gateway materialized snapshot" in result["error"]
+        assert not (snapshot_root / "new-skill").exists()
+
+    def test_create_refuses_local_symlink_alias_into_materialized_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """A local category alias must not turn derived cache into source."""
+        hermes_home = tmp_path / "hermes"
+        local = hermes_home / "skills"
+        snapshot_root = (
+            hermes_home
+            / "cache"
+            / "external-skills-snapshots"
+            / "roots-fingerprint"
+            / "generation-id"
+            / "root-0000"
+        )
+        local.mkdir(parents=True)
+        snapshot_root.mkdir(parents=True)
+        alias = local / "alias"
+        try:
+            alias.symlink_to(snapshot_root, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        content = VALID_SKILL_CONTENT.replace("test-skill", "new-skill")
+        real_lstat = Path.lstat
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        def mocked_lstat(path, *args, **kwargs):
+            if Path(path) == alias:
+                return reparse_metadata
+            return real_lstat(path, *args, **kwargs)
+
+        with _two_roots(local, snapshot_root), patch.object(
+            Path,
+            "lstat",
+            mocked_lstat,
+        ):
+            result = _create_skill("new-skill", content, category="alias")
+
+        assert result["success"] is False
+        assert "read-only gateway materialized snapshot" in result["error"]
+        assert not (snapshot_root / "new-skill").exists()
+
+    def test_edit_refuses_local_symlink_alias_into_materialized_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """Mutation guards must classify the alias before following it."""
+        hermes_home = tmp_path / "hermes"
+        local = hermes_home / "skills"
+        snapshot_root = (
+            hermes_home
+            / "cache"
+            / "external-skills-snapshots"
+            / "roots-fingerprint"
+            / "generation-id"
+            / "root-0000"
+        )
+        local.mkdir(parents=True)
+        snapshot_root.mkdir(parents=True)
+        skill_dir = _write_external_skill(snapshot_root)
+        original = (skill_dir / "SKILL.md").read_bytes()
+        alias = local / "alias"
+        try:
+            alias.symlink_to(snapshot_root, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        aliased_skill = alias / "ext-skill"
+        replacement = (skill_dir / "SKILL.md").read_text().replace(
+            "OLD_MARKER", "NEW_MARKER"
+        )
+
+        with _two_roots(local, snapshot_root), patch(
+            "tools.skill_manager_tool._find_skill",
+            return_value={"path": aliased_skill},
+        ):
+            result = _edit_skill("ext-skill", replacement)
+
+        assert result["success"] is False
+        assert "read-only gateway materialized snapshot" in result["error"]
+        assert (skill_dir / "SKILL.md").read_bytes() == original
+
+    def test_alias_guard_never_stats_target_outside_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        """Classifying a local alias must not traverse a remote target."""
+        from agent.skill_utils import is_external_skills_snapshot_path
+
+        hermes_home = tmp_path / "hermes"
+        local = hermes_home / "skills"
+        local.mkdir(parents=True)
+        remote = tmp_path / "unavailable-remote"
+        alias = local / "remote-alias"
+        try:
+            alias.symlink_to(remote, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        real_lstat = Path.lstat
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        def bounded_lstat(path, *args, **kwargs):
+            assert not str(path).startswith(str(remote))
+            if Path(path) == alias:
+                # Python 3.11 has no Path.is_junction(); its no-follow stat
+                # attributes are the only portable junction signal.
+                return reparse_metadata
+            return real_lstat(path, *args, **kwargs)
+
+        with patch.object(Path, "lstat", bounded_lstat):
+            assert not is_external_skills_snapshot_path(alias / "skill")
+
+    def test_windows_reparse_detection_fails_closed_without_attributes(self):
+        """A Windows 3.11 runtime may not silently lose junction detection."""
+        import agent.skill_utils as skill_utils
+
+        metadata = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)
+        with patch.object(
+            skill_utils,
+            "_WINDOWS_REPARSE_ATTRIBUTES_REQUIRED",
+            True,
+        ), pytest.raises(OSError, match="reparse-point detection"):
+            skill_utils.path_entry_is_redirect(
+                Path("never-opened"),
+                metadata=metadata,
+            )
+
+    def test_supplied_nofollow_metadata_never_requeries_junction_path(self):
+        """Python 3.12's is_junction must not reopen a descriptor-vetted path."""
+        import agent.skill_utils as skill_utils
+
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_file_attributes=0,
+        )
+        with patch.object(
+            Path,
+            "is_junction",
+            create=True,
+            side_effect=AssertionError("junction path was requeried"),
+        ) as junction:
+            assert not skill_utils.path_entry_is_redirect(
+                Path("never-opened"),
+                metadata=metadata,
+            )
+
+        junction.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("home", "raw_target"),
+        [
+            (
+                PureWindowsPath(r"C:\Hermes"),
+                r"\\?\C:\Hermes\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+            (
+                PureWindowsPath(r"\\server\share\Hermes"),
+                r"\\?\UNC\server\share\Hermes\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+            (
+                PureWindowsPath("C:/"),
+                r"\\?\C:\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+            (
+                PureWindowsPath("//server/share/"),
+                r"\\?\UNC\server\share\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+        ],
+    )
+    def test_windows_prefixed_junction_target_classifies_as_snapshot(
+        self,
+        home,
+        raw_target,
+    ):
+        """Python 3.11 junction substitution aliases compare lexically."""
+        import agent.skill_utils as skill_utils
+
+        snapshot_root = home / "cache" / "external-skills-snapshots"
+        classification = skill_utils._classify_windows_junction_substitution_target(
+            raw_target,
+            ("ext-skill",),
+            hermes_home=home,
+            snapshot_root=snapshot_root,
+        )
+
+        assert classification is not None
+        assert classification[0] == "snapshot"
+
+    @pytest.mark.parametrize("action", ["create", "edit", "delete"])
+    @pytest.mark.parametrize(
+        ("home", "raw_target"),
+        [
+            (
+                PureWindowsPath(r"C:\Hermes"),
+                r"\\?\C:\Hermes\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+            (
+                PureWindowsPath(r"\\server\share\Hermes"),
+                r"\\?\UNC\server\share\Hermes\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+            (
+                PureWindowsPath("C:/"),
+                r"\\?\C:\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+            (
+                PureWindowsPath("//server/share/"),
+                r"\\?\UNC\server\share\cache\external-skills-snapshots\fp\gen\root-0000",
+            ),
+        ],
+    )
+    def test_skill_manager_refuses_windows_prefixed_junction_alias(
+        self,
+        home,
+        raw_target,
+        action,
+    ):
+        """Create/edit/delete stop before following prefixed junction aliases."""
+        alias = home / "skills" / "alias"
+        skill_dir = alias / "ext-skill"
+        normal_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=0,
+        )
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        def mocked_lstat(path, *args, **kwargs):
+            normalized = str(path).replace("/", "\\").casefold()
+            if normalized == str(alias).casefold():
+                return reparse_metadata
+            return normal_metadata
+
+        def mocked_readlink(path, *args, **kwargs):
+            assert str(path).replace("/", "\\").casefold() == str(alias).casefold()
+            return raw_target
+
+        replacement = VALID_SKILL_CONTENT.replace("test-skill", "ext-skill")
+        with patch(
+            "tools.skill_manager_tool._find_skill",
+            return_value=None if action == "create" else {"path": skill_dir},
+        ), patch(
+            "tools.skill_manager_tool._resolve_skill_dir",
+            return_value=skill_dir,
+        ), patch(
+            "tools.skill_manager_tool._org_mirror_write_guard",
+            return_value=None,
+        ), patch(
+            "hermes_constants.get_hermes_home",
+            return_value=home,
+        ), patch.object(
+            Path,
+            "lstat",
+            mocked_lstat,
+        ), patch(
+            "agent.skill_utils.os.readlink",
+            side_effect=mocked_readlink,
+        ), patch(
+            "tools.skill_manager_tool.atomic_write_text",
+            side_effect=AssertionError("mutation reached snapshot content"),
+        ), patch(
+            "tools.skill_manager_tool.shutil.rmtree",
+            side_effect=AssertionError("delete reached snapshot content"),
+        ):
+            if action == "create":
+                result = _create_skill("ext-skill", replacement)
+            elif action == "edit":
+                result = _edit_skill("ext-skill", replacement)
+            else:
+                result = _delete_skill("ext-skill", absorbed_into="")
+
+        assert result["success"] is False
+        assert "read-only gateway materialized snapshot" in result["error"]
+
+    def test_ambiguous_windows_device_alias_fails_closed(self):
+        """Non-drive/non-UNC device namespaces never become writable."""
+        import agent.skill_utils as skill_utils
+
+        with pytest.raises(OSError, match="ambiguous Windows device"):
+            skill_utils._classify_windows_junction_substitution_target(
+                r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\snapshot",
+                ("ext-skill",),
+                hermes_home=PureWindowsPath(r"C:\Hermes"),
+                snapshot_root=PureWindowsPath(
+                    r"C:\Hermes\cache\external-skills-snapshots"
+                ),
+            )
+
+    @pytest.mark.parametrize(
+        "raw_target",
+        [
+            r"\\.\C:\Hermes\cache\external-skills-snapshots\fp\gen",
+            r"\DosDevices\C:\Hermes\cache\external-skills-snapshots\fp\gen",
+            r"\Device\HarddiskVolume3\Hermes\cache",
+        ],
+    )
+    def test_unrecognized_windows_device_namespaces_fail_closed(
+        self,
+        raw_target,
+    ):
+        """Device-shaped aliases never fall through as ordinary links."""
+        import agent.skill_utils as skill_utils
+
+        with pytest.raises(OSError, match="ambiguous Windows device"):
+            skill_utils._classify_windows_junction_substitution_target(
+                raw_target,
+                ("ext-skill",),
+                hermes_home=PureWindowsPath(r"C:\Hermes"),
+                snapshot_root=PureWindowsPath(
+                    r"C:\Hermes\cache\external-skills-snapshots"
+                ),
+            )
+
+    @pytest.mark.parametrize(
+        "raw_target",
+        [
+            r"\\?\UNC\server\\share\Hermes\cache\external-skills-snapshots",
+            r"\\?\C:\\Hermes\cache\external-skills-snapshots",
+        ],
+    )
+    def test_redundant_windows_substitution_separators_fail_closed(
+        self,
+        raw_target,
+    ):
+        """Windows-normalized empty components cannot bypass containment."""
+        import agent.skill_utils as skill_utils
+
+        with pytest.raises(OSError, match="ambiguous Windows"):
+            skill_utils._classify_windows_junction_substitution_target(
+                raw_target,
+                ("ext-skill",),
+                hermes_home=PureWindowsPath(r"\\server\share\Hermes"),
+                snapshot_root=PureWindowsPath(
+                    r"\\server\share\Hermes\cache\external-skills-snapshots"
+                ),
+            )
+
+    @pytest.mark.parametrize(
+        "action",
+        ["edit", "patch", "delete", "write_file", "remove_file"],
+    )
+    def test_gateway_materialized_snapshot_is_read_only(
+        self, tmp_path, monkeypatch, action
+    ):
+        """No mutation action may edit a derived gateway materialization."""
+        hermes_home = tmp_path / "hermes"
+        local = hermes_home / "skills"
+        snapshot_root = (
+            hermes_home
+            / "cache"
+            / "external-skills-snapshots"
+            / "roots-fingerprint"
+            / "generation-id"
+            / "root-0000"
+        )
+        local.mkdir(parents=True)
+        snapshot_root.mkdir(parents=True)
+        skill_dir = _write_external_skill(snapshot_root)
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "existing.md").write_text("preserve me")
+        before = {
+            str(path.relative_to(skill_dir)): path.read_bytes()
+            for path in skill_dir.rglob("*")
+            if path.is_file()
+        }
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        kwargs = {
+            "edit": {
+                "content": (skill_dir / "SKILL.md")
+                .read_text()
+                .replace("OLD_MARKER", "NEW_MARKER")
+            },
+            "patch": {"old_string": "OLD_MARKER", "new_string": "NEW_MARKER"},
+            "delete": {"absorbed_into": ""},
+            "write_file": {
+                "file_path": "references/new.md",
+                "file_content": "new content",
+            },
+            "remove_file": {"file_path": "references/existing.md"},
+        }[action]
+
+        with _two_roots(local, snapshot_root):
+            result = json.loads(
+                skill_manage(action=action, name="ext-skill", **kwargs)
+            )
+
+        after = {
+            str(path.relative_to(skill_dir)): path.read_bytes()
+            for path in skill_dir.rglob("*")
+            if path.is_file()
+        }
+        assert result["success"] is False
+        assert "read-only gateway materialized snapshot" in result["error"]
+        assert after == before
 
     def test_patch_external_skill_writes_in_place(self, tmp_path):
         local = tmp_path / "local"

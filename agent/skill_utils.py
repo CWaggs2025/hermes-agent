@@ -10,12 +10,13 @@ import hashlib
 import json
 import logging
 import math
+import ntpath
 import os
 import re
 import stat as stat_module
 import sys
 import threading
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
@@ -36,6 +37,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
+        ".bundled-sync-staging",
         ".curator_backups",
         ".venv",
         "venv",
@@ -89,8 +91,10 @@ def read_active_org_id(skills_dir: Path) -> Optional[str]:
 def is_org_mirror_path(path, skills_dir: Path) -> bool:
     """True when *path* is inside the org mirror (``_org/``)."""
     try:
-        rel = Path(path).resolve().relative_to(Path(skills_dir).resolve())
-    except (OSError, ValueError):
+        candidate = Path(os.path.abspath(os.path.normpath(str(path))))
+        root = Path(os.path.abspath(os.path.normpath(str(skills_dir))))
+        rel = candidate.relative_to(root)
+    except ValueError:
         return False
     return bool(rel.parts) and rel.parts[0] == ORG_MIRROR_DIR_NAME
 
@@ -98,8 +102,10 @@ def is_org_mirror_path(path, skills_dir: Path) -> bool:
 def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     """The ``<org_id>`` segment for a path under ``_org/<org_id>/...``."""
     try:
-        rel = Path(path).resolve().relative_to(Path(skills_dir).resolve())
-    except (OSError, ValueError):
+        candidate = Path(os.path.abspath(os.path.normpath(str(path))))
+        root = Path(os.path.abspath(os.path.normpath(str(skills_dir))))
+        rel = candidate.relative_to(root)
+    except ValueError:
         return None
     if len(rel.parts) >= 2 and rel.parts[0] == ORG_MIRROR_DIR_NAME:
         return rel.parts[1]
@@ -147,7 +153,9 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     for idx, part in enumerate(parts[:-1]):
         if part not in SKILL_SUPPORT_DIRS or idx == 0:
             continue
-        skill_root = Path(*parts[:idx])
+        skill_root = path_obj
+        for _ in range(len(parts) - idx):
+            skill_root = skill_root.parent
         if root is not None and not path_obj.is_absolute():
             skill_root = root / skill_root
         if (skill_root / "SKILL.md").exists():
@@ -533,13 +541,96 @@ EXTERNAL_SKILLS_MAX_CATALOG_BYTES = 8 * 1024 * 1024
 _EXTERNAL_SKILLS_CATALOG_FILENAME = "external-skills-catalog.json"
 _EXTERNAL_SKILLS_SNAPSHOT_DIRNAME = "external-skills-snapshots"
 EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX = ".read-lease.lock"
+# ``Path.is_junction`` was added in Python 3.12.  Supported Windows 3.11
+# runtimes still expose ``st_file_attributes`` from lstat(), so require that
+# lower-level signal there instead of silently treating junctions and other
+# reparse points as ordinary directories.
+_WINDOWS_REPARSE_ATTRIBUTES_REQUIRED = os.name == "nt"
+
+
+def path_entry_is_redirect(path: Path, *, metadata: Any = None) -> bool:
+    """Return whether one path entry can redirect filesystem traversal.
+
+    The check is intentionally entry-local: callers choose the bounded local
+    components they are willing to inspect, and this function never resolves
+    or stats a link target.  On Windows every reparse point is unsafe for the
+    immutable snapshot and private-staging contracts, not only symlinks and
+    mount-point junctions.  Python 3.11 lacks ``Path.is_junction()``, so the
+    no-follow ``st_file_attributes`` bit is authoritative.  If that secure
+    signal is unavailable on Windows, fail closed instead of following paths.
+    """
+    candidate = Path(path)
+    if metadata is None:
+        metadata = candidate.stat(follow_symlinks=False)
+    if stat_module.S_ISLNK(metadata.st_mode):
+        return True
+
+    attributes = getattr(metadata, "st_file_attributes", None)
+    reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", None)
+    if attributes is not None:
+        if reparse_flag is None:
+            raise OSError("Windows reparse-point detection is unavailable")
+        try:
+            if int(attributes) & int(reparse_flag):
+                return True
+        except (TypeError, ValueError) as exc:
+            raise OSError("invalid Windows file attributes") from exc
+
+    if _WINDOWS_REPARSE_ATTRIBUTES_REQUIRED and attributes is None:
+        raise OSError("Windows reparse-point detection is unavailable")
+    return False
+
+
+def path_has_redirected_component(
+    path: Path,
+    *,
+    root: Path,
+    allow_missing: bool = False,
+) -> bool:
+    """Inspect a bounded lexical path chain without touching redirect targets.
+
+    ``path`` must be inside ``root``.  Each existing entry is lstat'd before
+    the next component is considered, so discovery stops at a junction rather
+    than accidentally probing its target.  Missing suffixes are safe only for
+    callers that will create them themselves.
+    """
+    normalized_root = Path(os.path.abspath(os.path.normpath(str(root))))
+    normalized_path = Path(os.path.abspath(os.path.normpath(str(path))))
+    root_text = os.path.normcase(str(normalized_root))
+    path_text = os.path.normcase(str(normalized_path))
+    try:
+        if os.path.commonpath((root_text, path_text)) != root_text:
+            raise OSError(f"path escapes bounded local root: {path}")
+        relative_text = os.path.relpath(str(normalized_path), str(normalized_root))
+    except ValueError as exc:
+        raise OSError(f"path escapes bounded local root: {path}") from exc
+
+    components: Tuple[str, ...]
+    if relative_text in ("", os.curdir):
+        components = ()
+    else:
+        components = Path(relative_text).parts
+    current = normalized_root
+    for component in (None, *components):
+        if component is not None:
+            current = current / component
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            if allow_missing:
+                return False
+            raise
+        if path_entry_is_redirect(current, metadata=metadata):
+            return True
+    return False
 
 
 class _ExternalSnapshotReadLease:
     """One process-local reference to a cross-process generation read lock."""
 
-    def __init__(self, key: str):
+    def __init__(self, key: str, generation_identity: Tuple[int, int]):
         self._key = key
+        self.generation_identity = generation_identity
         self._closed = False
 
     def close(self) -> None:
@@ -560,31 +651,452 @@ class _ExternalSnapshotReadLease:
 class _LeasedSnapshotPath(type(Path())):
     """Concrete ``Path`` retaining a read lease for its generation."""
 
-    __slots__ = ("_external_snapshot_lease",)
+    __slots__ = (
+        "_external_snapshot_lease",
+        "_external_snapshot_hermes_home",
+        "_external_snapshot_identity",
+        "_external_snapshot_root",
+    )
 
-    def __new__(cls, path: Path, lease: _ExternalSnapshotReadLease):
+    def __new__(
+        cls,
+        path: Path,
+        lease: _ExternalSnapshotReadLease,
+        hermes_home: Path,
+        identity: Tuple[int, int],
+        root: Optional[Path] = None,
+    ):
         instance = super().__new__(cls, path)
         instance._external_snapshot_lease = lease
+        instance._external_snapshot_hermes_home = hermes_home
+        instance._external_snapshot_identity = identity
+        instance._external_snapshot_root = Path(root or path)
         return instance
 
+    def _guarded(self, path: Path):
+        return type(self)(
+            path,
+            self._external_snapshot_lease,
+            Path(self._external_snapshot_hermes_home),
+            self._external_snapshot_identity,
+            root=Path(self._external_snapshot_root),
+        )
 
-_GATEWAY_EXTERNAL_SNAPSHOT_LEASES: Dict[str, Tuple[Any, int]] = {}
+    def _make_child(self, args):
+        return self._guarded(Path(str(self)).joinpath(*args))
+
+    def _make_child_relpath(self, part):
+        return self._guarded(Path(str(self)) / part)
+
+    @property
+    def parent(self):
+        return self._guarded(Path(str(self)).parent)
+
+    def with_name(self, name):
+        return self._guarded(Path(str(self)).with_name(name))
+
+    def with_suffix(self, suffix):
+        return self._guarded(Path(str(self)).with_suffix(suffix))
+
+    def relative_to(self, *other):
+        # Relative results are lexical display/identity values, not access
+        # paths, and therefore intentionally lose the cache-read capability.
+        return Path(str(self)).relative_to(*other)
+
+    def resolve(self, strict=False):
+        if strict:
+            self.stat()
+        normalized = Path(os.path.abspath(os.path.normpath(str(self))))
+        return self._guarded(normalized)
+
+    def absolute(self):
+        return self._guarded(Path(os.path.abspath(str(self))))
+
+    def _deny_mutation(self, *args, **kwargs):
+        del args, kwargs
+        raise OSError("gateway materialized snapshots are read-only")
+
+    chmod = _deny_mutation
+    hardlink_to = _deny_mutation
+    lchmod = _deny_mutation
+    link_to = _deny_mutation
+    mkdir = _deny_mutation
+    rename = _deny_mutation
+    replace = _deny_mutation
+    rmdir = _deny_mutation
+    symlink_to = _deny_mutation
+    touch = _deny_mutation
+    unlink = _deny_mutation
+    write_bytes = _deny_mutation
+    write_text = _deny_mutation
+
+    def stat(self, *, follow_symlinks=True):
+        del follow_symlinks
+        root = Path(self._external_snapshot_root)
+        candidate = Path(os.path.abspath(os.path.normpath(str(self))))
+        if candidate == root:
+            descriptor = _open_gateway_cache_directory(
+                candidate,
+                hermes_home=Path(self._external_snapshot_hermes_home),
+                expected_directory=(root, self._external_snapshot_identity),
+            )
+            try:
+                return os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+        parent_fd = _open_gateway_cache_directory(
+            candidate.parent,
+            hermes_home=Path(self._external_snapshot_hermes_home),
+            expected_directory=(root, self._external_snapshot_identity),
+        )
+        try:
+            metadata = os.stat(
+                candidate.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if path_entry_is_redirect(candidate, metadata=metadata):
+                raise OSError(f"gateway snapshot entry is redirected: {candidate}")
+            return metadata
+        finally:
+            os.close(parent_fd)
+
+    def lstat(self):
+        return self.stat(follow_symlinks=False)
+
+    def readlink(self):
+        raise OSError("gateway materialized snapshots cannot contain redirects")
+
+    def _scandir(self):
+        descriptor = _open_gateway_cache_directory(
+            Path(str(self)),
+            hermes_home=Path(self._external_snapshot_hermes_home),
+            expected_directory=(
+                Path(self._external_snapshot_root),
+                self._external_snapshot_identity,
+            ),
+        )
+        try:
+            return _GatewaySnapshotScandir(
+                descriptor,
+                owner=Path(str(self)),
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def iterdir(self):
+        with self._scandir() as entries:
+            names = [entry.name for entry in entries]
+        for name in names:
+            yield self._make_child_relpath(name)
+
+    def open(
+        self,
+        mode="r",
+        buffering=-1,
+        encoding=None,
+        errors=None,
+        newline=None,
+    ):
+        """Open a materialized file through its identity-pinned local root."""
+        if mode not in ("r", "rt", "rb"):
+            raise OSError("gateway materialized snapshots are read-only")
+        parent_fd = -1
+        file_fd = -1
+        try:
+            parent_fd = _open_gateway_cache_directory(
+                self.parent,
+                hermes_home=Path(self._external_snapshot_hermes_home),
+                expected_directory=(
+                    Path(self._external_snapshot_root),
+                    self._external_snapshot_identity,
+                ),
+            )
+            file_fd = os.open(
+                self.name,
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | os.O_NOFOLLOW
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+            metadata = os.fstat(file_fd)
+            if not stat_module.S_ISREG(metadata.st_mode):
+                raise OSError(f"gateway snapshot entry is not a regular file: {self}")
+            if "b" in mode:
+                handle = os.fdopen(file_fd, mode, buffering=buffering)
+            else:
+                handle = os.fdopen(
+                    file_fd,
+                    mode,
+                    buffering=buffering,
+                    encoding=encoding,
+                    errors=errors,
+                    newline=newline,
+                )
+            file_fd = -1
+            return handle
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+            if parent_fd >= 0:
+                os.close(parent_fd)
+
+
+class _GatewaySnapshotDirEntry:
+    """No-follow metadata retained after a descriptor scandir closes."""
+
+    def __init__(self, name: str, metadata: Any):
+        self.name = name
+        self._metadata = metadata
+
+    def stat(self, *, follow_symlinks=True):
+        del follow_symlinks
+        return self._metadata
+
+    def is_dir(self, *, follow_symlinks=True) -> bool:
+        del follow_symlinks
+        return stat_module.S_ISDIR(self._metadata.st_mode)
+
+    def is_file(self, *, follow_symlinks=True) -> bool:
+        del follow_symlinks
+        return stat_module.S_ISREG(self._metadata.st_mode)
+
+
+class _GatewaySnapshotScandir:
+    """Context-managed scandir that owns its directory descriptor."""
+
+    def __init__(self, descriptor: int, *, owner: Path):
+        self._descriptor = descriptor
+        self._owner = owner
+        self._iterator = os.scandir(descriptor)
+
+    def __enter__(self):
+        return self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            entry = next(self._iterator)
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+                if path_entry_is_redirect(
+                    self._owner / entry.name,
+                    metadata=metadata,
+                ):
+                    continue
+            except OSError:
+                continue
+            return _GatewaySnapshotDirEntry(entry.name, metadata)
+
+    def close(self) -> None:
+        try:
+            self._iterator.close()
+        finally:
+            if self._descriptor >= 0:
+                os.close(self._descriptor)
+                self._descriptor = -1
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+
+def is_gateway_materialized_snapshot_path(path: Path) -> bool:
+    """Whether ``path`` retains the gateway's descriptor-read capability."""
+    return isinstance(path, _LeasedSnapshotPath) and all(
+        hasattr(path, attribute)
+        for attribute in (
+            "_external_snapshot_lease",
+            "_external_snapshot_hermes_home",
+            "_external_snapshot_identity",
+            "_external_snapshot_root",
+        )
+    )
+
+
+_GATEWAY_EXTERNAL_SNAPSHOT_LEASES: Dict[
+    str,
+    Tuple[Any, int, Tuple[int, int]],
+] = {}
 _GATEWAY_EXTERNAL_SNAPSHOT_LEASES_LOCK = threading.Lock()
 
 
-def _open_gateway_external_snapshot_lease(generation: Path):
+def _gateway_cache_dirfd_supported() -> bool:
+    """Whether local gateway cache access can be kept descriptor-relative.
+
+    The leased Path capability below relies on Python 3.11 pathlib derivative
+    hooks.  Python 3.12/3.13 route glob/derivative operations through different
+    internals that can reopen by pathname, so external snapshot consumption is
+    disabled there until it has a fully public descriptor-walker API.  The
+    foreground reconciler remains available; the gateway simply exposes no
+    external snapshot rather than weakening the no-follow guarantee.
+    """
+    return (
+        os.name != "nt"
+        and getattr(sys.implementation, "name", "") == "cpython"
+        and sys.version_info[:2] == (3, 11)
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and os.open in getattr(os, "supports_dir_fd", ())
+        and os.stat in getattr(os, "supports_dir_fd", ())
+        and os.scandir in getattr(os, "supports_fd", ())
+    )
+
+
+def _gateway_cache_relative_parts(
+    path: Path,
+    *,
+    hermes_home: Path,
+) -> Tuple[str, ...]:
+    """Return a bounded lexical path beneath ``HERMES_HOME/cache``."""
+    home = Path(os.path.abspath(os.path.normpath(str(hermes_home))))
+    cache = home / "cache"
+    candidate = Path(os.path.abspath(os.path.normpath(str(path))))
+    try:
+        if os.path.commonpath(
+            (os.path.normcase(str(cache)), os.path.normcase(str(candidate)))
+        ) != os.path.normcase(str(cache)):
+            raise OSError(f"gateway snapshot path escapes local cache: {path}")
+        relative = os.path.relpath(str(candidate), str(cache))
+    except ValueError as exc:
+        raise OSError(f"gateway snapshot path escapes local cache: {path}") from exc
+    if relative in ("", os.curdir):
+        return ()
+    parts = Path(relative).parts
+    if any(part in ("", os.curdir, os.pardir) for part in parts):
+        raise OSError(f"gateway snapshot path escapes local cache: {path}")
+    return tuple(parts)
+
+
+def _open_gateway_cache_directory(
+    path: Path,
+    *,
+    hermes_home: Path,
+    expected_directory: Optional[Tuple[Path, Tuple[int, int]]] = None,
+) -> int:
+    """Open one local cache directory by no-follow descent from its anchor.
+
+    Windows/Python 3.11 has no handle-relative ``os.open``.  Snapshot reads are
+    therefore disabled there instead of falling back to a check-then-open path
+    that a junction swap could redirect onto a remote share.
+    """
+    home = Path(os.path.abspath(os.path.normpath(str(hermes_home))))
+    cache_parts = _gateway_cache_relative_parts(path, hermes_home=home)
+    if not _gateway_cache_dirfd_supported():
+        raise OSError(
+            "race-safe descriptor-relative gateway snapshot access is unavailable"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(home.anchor, flags)
+    expected_path = None
+    expected_identity = None
+    expected_seen = False
+    if expected_directory is not None:
+        expected_path = Path(
+            os.path.abspath(os.path.normpath(str(expected_directory[0])))
+        )
+        _gateway_cache_relative_parts(expected_path, hermes_home=home)
+        expected_identity = expected_directory[1]
+    current = Path(home.anchor)
+    try:
+        for component in (*home.parts[1:], "cache", *cache_parts):
+            next_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=descriptor,
+            )
+            metadata = os.fstat(next_descriptor)
+            if not stat_module.S_ISDIR(metadata.st_mode):
+                os.close(next_descriptor)
+                raise OSError(
+                    f"gateway snapshot component is not a directory: {component}"
+                )
+            current = current / component
+            if expected_path is not None and current == expected_path:
+                observed_identity = (int(metadata.st_dev), int(metadata.st_ino))
+                if observed_identity != expected_identity:
+                    os.close(next_descriptor)
+                    raise OSError(
+                        "gateway snapshot generation changed before access"
+                    )
+                expected_seen = True
+            os.close(descriptor)
+            descriptor = next_descriptor
+        if expected_path is not None and not expected_seen:
+            raise OSError("gateway snapshot identity root is outside target path")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_gateway_cache_regular_file(
+    path: Path,
+    max_bytes: int,
+    *,
+    hermes_home: Path,
+) -> bytes:
+    """Read one bounded cache file without a check/use path traversal gap."""
+    parent_fd = -1
+    file_fd = -1
+    try:
+        parent_fd = _open_gateway_cache_directory(
+            Path(path).parent,
+            hermes_home=hermes_home,
+        )
+        file_fd = os.open(
+            Path(path).name,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_fd,
+        )
+        metadata = os.fstat(file_fd)
+        if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+            raise OSError(f"unsafe or oversized gateway snapshot file: {path}")
+        chunks: List[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            try:
+                chunk = os.read(file_fd, min(64 * 1024, remaining))
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > max_bytes:
+            raise OSError(f"gateway snapshot file exceeds {max_bytes} bytes: {path}")
+        return encoded
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _open_gateway_external_snapshot_lease(
+    generation: Path,
+    *,
+    hermes_home: Path,
+):
     """Acquire a shared, nonblocking lease on one local generation."""
     parent_fd = -1
     lease_fd = -1
     handle = None
     lease_name = f".{generation.name}{EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX}"
     try:
-        directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
         lease_flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -592,26 +1104,30 @@ def _open_gateway_external_snapshot_lease(generation: Path):
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
         )
-        supports_dir_fd = os.open in getattr(os, "supports_dir_fd", ())
-        if supports_dir_fd:
-            parent_fd = os.open(generation.parent, directory_flags)
-            lease_fd = os.open(
-                lease_name,
-                lease_flags,
-                0o600,
-                dir_fd=parent_fd,
-            )
-        else:
-            if generation.is_symlink():
-                return None
-            lease_path = generation.parent / lease_name
-            try:
-                lease_stat = lease_path.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                lease_stat = None
-            if lease_stat is not None and stat_module.S_ISLNK(lease_stat.st_mode):
-                return None
-            lease_fd = os.open(lease_path, lease_flags, 0o600)
+        parent_fd = _open_gateway_cache_directory(
+            generation.parent,
+            hermes_home=hermes_home,
+        )
+        generation_metadata = os.stat(
+            generation.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if path_entry_is_redirect(
+            generation,
+            metadata=generation_metadata,
+        ) or not stat_module.S_ISDIR(generation_metadata.st_mode):
+            return None
+        generation_identity = (
+            int(generation_metadata.st_dev),
+            int(generation_metadata.st_ino),
+        )
+        lease_fd = os.open(
+            lease_name,
+            lease_flags,
+            0o600,
+            dir_fd=parent_fd,
+        )
 
         metadata = os.fstat(lease_fd)
         if not stat_module.S_ISREG(metadata.st_mode):
@@ -634,7 +1150,7 @@ def _open_gateway_external_snapshot_lease(generation: Path):
             import fcntl
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-        return handle
+        return handle, generation_identity
     except (BlockingIOError, OSError, PermissionError):
         if handle is not None:
             try:
@@ -671,19 +1187,48 @@ def _close_gateway_external_snapshot_lease(handle) -> None:
 
 def _acquire_gateway_external_snapshot_lease(
     generation: Path,
+    *,
+    hermes_home: Path,
 ) -> Optional[_ExternalSnapshotReadLease]:
     key = os.path.normcase(os.path.abspath(str(generation)))
     with _GATEWAY_EXTERNAL_SNAPSHOT_LEASES_LOCK:
         existing = _GATEWAY_EXTERNAL_SNAPSHOT_LEASES.get(key)
         if existing is not None:
-            handle, references = existing
-            _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (handle, references + 1)
-            return _ExternalSnapshotReadLease(key)
-        handle = _open_gateway_external_snapshot_lease(generation)
-        if handle is None:
+            handle, references, expected_identity = existing
+            directory_fd = -1
+            try:
+                directory_fd = _open_gateway_cache_directory(
+                    generation,
+                    hermes_home=hermes_home,
+                )
+                metadata = os.fstat(directory_fd)
+                observed_identity = (int(metadata.st_dev), int(metadata.st_ino))
+            except OSError:
+                return None
+            finally:
+                if directory_fd >= 0:
+                    os.close(directory_fd)
+            if observed_identity != expected_identity:
+                return None
+            _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (
+                handle,
+                references + 1,
+                expected_identity,
+            )
+            return _ExternalSnapshotReadLease(key, expected_identity)
+        opened = _open_gateway_external_snapshot_lease(
+            generation,
+            hermes_home=hermes_home,
+        )
+        if opened is None:
             return None
-        _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (handle, 1)
-        return _ExternalSnapshotReadLease(key)
+        handle, generation_identity = opened
+        _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (
+            handle,
+            1,
+            generation_identity,
+        )
+        return _ExternalSnapshotReadLease(key, generation_identity)
 
 
 def _release_gateway_external_snapshot_lease(key: str) -> None:
@@ -692,11 +1237,12 @@ def _release_gateway_external_snapshot_lease(key: str) -> None:
         existing = _GATEWAY_EXTERNAL_SNAPSHOT_LEASES.get(key)
         if existing is None:
             return
-        candidate, references = existing
+        candidate, references, generation_identity = existing
         if references > 1:
             _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (
                 candidate,
                 references - 1,
+                generation_identity,
             )
             return
         handle = candidate
@@ -716,6 +1262,10 @@ def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
     parent_fd = -1
     file_fd = -1
     try:
+        if path_entry_is_redirect(path.parent):
+            raise OSError(
+                f"refusing to read through redirected parent: {path.parent}"
+            )
         directory_flags = (
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
@@ -740,8 +1290,8 @@ def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
             # Reject an observed link before opening, then compare the opened
             # file identity with the no-follow metadata below.
             path_stat = path.stat(follow_symlinks=False)
-            if stat_module.S_ISLNK(path_stat.st_mode):
-                raise OSError(f"refusing to read symlink: {path}")
+            if path_entry_is_redirect(path, metadata=path_stat):
+                raise OSError(f"refusing to read redirected path: {path}")
             file_fd = os.open(path, file_flags)
 
         opened_stat = os.fstat(file_fd)
@@ -792,7 +1342,355 @@ def external_skills_snapshot_dir(hermes_home: Optional[Path] = None) -> Path:
         from hermes_constants import get_hermes_home
 
         hermes_home = get_hermes_home()
-    return Path(hermes_home) / "cache" / _EXTERNAL_SKILLS_SNAPSHOT_DIRNAME
+    base = (
+        hermes_home
+        if isinstance(hermes_home, (Path, PureWindowsPath))
+        else Path(hermes_home)
+    )
+    return base / "cache" / _EXTERNAL_SKILLS_SNAPSHOT_DIRNAME
+
+
+def _normalize_windows_junction_substitution_path(raw_target: str) -> Optional[str]:
+    """Normalize a Windows reparse substitution target without resolving it.
+
+    Python 3.11 can return the kernel substitution form for a junction from
+    :func:`os.readlink` (for example ``\\\\?\\C:\\...`` or
+    ``\\\\?\\UNC\\server\\share\\...``). ``Path`` and ``commonpath`` do
+    not compare those aliases consistently with ordinary Win32 paths, which
+    could make a junction into the immutable materialization cache look like
+    an unrelated path. Accept only absolute drive and UNC namespaces that can
+    be reduced lexically. Other device namespaces (``GLOBALROOT``, volume
+    GUIDs, malformed UNC paths, and so on) are deliberately ambiguous and
+    therefore fail closed.
+
+    ``None`` means the target is not a Windows substitution path and the
+    caller should use its normal native-path handling.
+    """
+    if not isinstance(raw_target, str):
+        raise OSError("junction target is not text")
+
+    target = raw_target.replace("/", "\\")
+    lowered = target.casefold()
+    device_prefix = "\\\\?\\"
+    nt_prefix = "\\??\\"
+    prefix = None
+    if lowered.startswith(device_prefix.casefold()):
+        prefix = device_prefix
+    elif lowered.startswith(nt_prefix.casefold()):
+        prefix = nt_prefix
+    if prefix is None:
+        ambiguous_device_prefixes = (
+            "\\\\.\\",
+            "\\dosdevices\\",
+            "\\device\\",
+            "\\global??\\",
+        )
+        if lowered.startswith(ambiguous_device_prefixes):
+            raise OSError("ambiguous Windows device junction target")
+        return None
+
+    remainder = target[len(prefix):]
+    if remainder.casefold().startswith("unc\\"):
+        unc_tail = remainder[4:]
+        components = unc_tail.split("\\")
+        if components and components[-1] == "":
+            components.pop()
+        if (
+            len(components) < 2
+            or any(part in ("", os.curdir, os.pardir) for part in components)
+        ):
+            raise OSError("ambiguous Windows UNC junction target")
+        normalized = ntpath.normpath("\\\\" + "\\".join(components))
+    elif re.match(r"^[A-Za-z]:\\", remainder):
+        drive_components = remainder[3:].split("\\")
+        if drive_components and drive_components[-1] == "":
+            drive_components.pop()
+        if any(
+            part in ("", os.curdir, os.pardir)
+            for part in drive_components
+        ):
+            raise OSError("ambiguous Windows drive junction target")
+        normalized = ntpath.normpath(remainder)
+    else:
+        raise OSError("ambiguous Windows device junction target")
+
+    drive, tail = ntpath.splitdrive(normalized)
+    if not drive or not tail.startswith("\\") or not ntpath.isabs(normalized):
+        raise OSError("junction target is not an absolute Windows path")
+    return normalized
+
+
+def _windows_absolute_path_key(value: Any) -> Optional[str]:
+    """Return a case-folded absolute Win32 key, or ``None`` for native POSIX."""
+    raw = str(value).replace("/", "\\")
+    substituted = _normalize_windows_junction_substitution_path(raw)
+    normalized = ntpath.normpath(substituted if substituted is not None else raw)
+    drive, tail = ntpath.splitdrive(normalized)
+    if not drive or not tail.startswith("\\") or not ntpath.isabs(normalized):
+        return None
+    # Preserve the separator that makes a drive/share root absolute. Stripping
+    # ``C:\\`` to ``C:`` would turn a valid root into a drive-relative path and
+    # could make an alias below a root-level HERMES_HOME evade containment.
+    canonical = normalized if tail == "\\" else normalized.rstrip("\\")
+    return ntpath.normcase(canonical)
+
+
+def _windows_strict_child(candidate: str, root: str) -> bool:
+    if candidate == root:
+        return False
+    try:
+        return ntpath.commonpath((root, candidate)) == root
+    except ValueError:
+        return False
+
+
+def _classify_windows_junction_substitution_target(
+    raw_target: str,
+    remaining_parts: Tuple[str, ...],
+    *,
+    hermes_home: Path,
+    snapshot_root: Path,
+) -> Optional[Tuple[str, str]]:
+    """Classify one prefixed junction target using Windows lexical rules.
+
+    Returns ``None`` for an ordinary/native readlink value. Otherwise returns
+    ``(classification, normalized_candidate)`` where classification is one of
+    ``snapshot``, ``home``, or ``external``. If the caller's home/snapshot
+    paths are not comparable absolute Windows paths, classification is
+    ambiguous and raises so mutation callers deny the operation.
+    """
+    normalized_target = _normalize_windows_junction_substitution_path(raw_target)
+    if normalized_target is None:
+        return None
+    candidate = ntpath.normpath(ntpath.join(normalized_target, *remaining_parts))
+    candidate_key = _windows_absolute_path_key(candidate)
+    home_key = _windows_absolute_path_key(hermes_home)
+    snapshot_key = _windows_absolute_path_key(snapshot_root)
+    if candidate_key is None or home_key is None or snapshot_key is None:
+        raise OSError("Windows junction target cannot be compared to HERMES_HOME")
+    if _windows_strict_child(candidate_key, snapshot_key):
+        return "snapshot", candidate
+    if candidate_key == home_key or _windows_strict_child(candidate_key, home_key):
+        return "home", candidate
+    return "external", candidate
+
+
+def is_external_skills_snapshot_path(
+    path: Path,
+    *,
+    hermes_home: Optional[Path] = None,
+) -> bool:
+    """Return whether *path* is inside the private materialization cache.
+
+    This is a bounded local-state check: it never resolves or stats a
+    configured external root.  In addition to the lexical path, it follows
+    only symlink/junction aliases whose entries and targets remain inside the
+    active HERMES_HOME.  That closes a local ``skills/alias`` -> snapshot
+    write bypass without ever walking a configured remote skill source.
+
+    Materialized generations are immutable inputs to gateway discovery, not
+    writable stand-ins for their authoritative sources, so mutation tools use
+    this predicate as a hard guard.
+    """
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    snapshot_root = external_skills_snapshot_dir(hermes_home)
+
+    windows_home_key = _windows_absolute_path_key(hermes_home)
+    windows_path_key = _windows_absolute_path_key(path)
+    windows_snapshot_key = _windows_absolute_path_key(snapshot_root)
+    if (
+        windows_home_key is not None
+        and windows_path_key is not None
+        and windows_snapshot_key is not None
+    ):
+        if windows_path_key == windows_snapshot_key:
+            return False
+        if _windows_strict_child(windows_path_key, windows_snapshot_key):
+            return True
+        if windows_path_key != windows_home_key and not _windows_strict_child(
+            windows_path_key,
+            windows_home_key,
+        ):
+            return False
+
+        candidate_text = ntpath.normpath(str(path).replace("/", "\\"))
+        home_text = ntpath.normpath(str(hermes_home).replace("/", "\\"))
+        snapshot_text = ntpath.normpath(str(snapshot_root).replace("/", "\\"))
+        seen_windows: Set[str] = set()
+        for _hop in range(64):
+            candidate_key = _windows_absolute_path_key(candidate_text)
+            if candidate_key is None:
+                raise OSError("Windows skill alias became non-absolute")
+            if _windows_strict_child(candidate_key, windows_snapshot_key):
+                return True
+            try:
+                relative_text = ntpath.relpath(candidate_text, home_text)
+            except ValueError:
+                return False
+            if relative_text == os.pardir or relative_text.startswith(
+                os.pardir + "\\"
+            ):
+                return False
+
+            current_text = home_text
+            redirected = False
+            parts = PureWindowsPath(relative_text).parts
+            for index, part in enumerate(parts):
+                current_text = ntpath.join(current_text, part)
+                current_probe = Path(current_text)
+                try:
+                    metadata = current_probe.lstat()
+                except FileNotFoundError:
+                    return False
+                if not path_entry_is_redirect(current_probe, metadata=metadata):
+                    continue
+
+                alias_key = _windows_absolute_path_key(current_text)
+                if alias_key is None or alias_key in seen_windows:
+                    raise OSError(f"local skill alias cycle at {current_text}")
+                seen_windows.add(alias_key)
+                raw_target = os.readlink(current_probe)
+                classified = _classify_windows_junction_substitution_target(
+                    raw_target,
+                    tuple(str(item) for item in parts[index + 1:]),
+                    hermes_home=PureWindowsPath(home_text),
+                    snapshot_root=PureWindowsPath(snapshot_text),
+                )
+                if classified is None:
+                    target_text = str(raw_target).replace("/", "\\")
+                    if not ntpath.isabs(target_text):
+                        target_text = ntpath.join(
+                            ntpath.dirname(current_text),
+                            target_text,
+                        )
+                    candidate_text = ntpath.normpath(
+                        ntpath.join(target_text, *parts[index + 1:])
+                    )
+                else:
+                    classification, candidate_text = classified
+                    if classification == "snapshot":
+                        return True
+                    if classification == "external":
+                        return False
+                redirected = True
+                break
+            if not redirected:
+                return False
+        raise OSError("too many local Windows skill alias hops")
+
+    def _normalized_absolute(value: Path) -> Path:
+        return Path(os.path.abspath(os.path.normpath(str(value))))
+
+    def _strict_child(candidate: Path, root: Path) -> bool:
+        candidate_text = os.path.normcase(str(_normalized_absolute(candidate)))
+        root_text = os.path.normcase(str(_normalized_absolute(root)))
+        if candidate_text == root_text:
+            return False
+        try:
+            return os.path.commonpath((root_text, candidate_text)) == root_text
+        except ValueError:
+            # Different Windows drives cannot have a common path.
+            return False
+
+    root_text = os.path.normcase(
+        os.path.abspath(os.path.normpath(str(snapshot_root)))
+    )
+    path_text = os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+    if path_text == root_text:
+        return False
+    try:
+        if os.path.commonpath((root_text, path_text)) == root_text:
+            return True
+    except ValueError:
+        # Different Windows drives cannot have a common path.
+        return False
+
+    home = _normalized_absolute(Path(hermes_home))
+    candidate = _normalized_absolute(Path(path))
+    if candidate == home or not _strict_child(candidate, home):
+        # Never inspect a configured external/NAS path merely to decide
+        # whether it aliases back into the local cache.
+        return False
+
+    # Resolve local aliases lexically, reading only the alias entries below
+    # HERMES_HOME.  If an alias points outside that boundary, stop before
+    # touching its target.  The hop cap also fails closed on local cycles.
+    seen: Set[str] = set()
+    for _hop in range(64):
+        if _strict_child(candidate, snapshot_root):
+            return True
+        try:
+            relative = candidate.relative_to(home)
+        except ValueError:
+            return False
+
+        current = home
+        redirected = False
+        parts = relative.parts
+        for index, part in enumerate(parts):
+            current = current / part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                # A not-yet-created suffix cannot contain another alias.
+                return False
+            except OSError:
+                # Ownership could not be established.  The mutation guard
+                # treats predicate errors as a refusal; surface that path.
+                raise
+
+            is_redirect = path_entry_is_redirect(current, metadata=metadata)
+            if not is_redirect:
+                continue
+
+            alias_key = os.path.normcase(str(_normalized_absolute(current)))
+            if alias_key in seen:
+                raise OSError(f"local skill alias cycle at {current}")
+            seen.add(alias_key)
+
+            raw_target = os.readlink(current)
+            windows_target = _classify_windows_junction_substitution_target(
+                raw_target,
+                tuple(str(part) for part in parts[index + 1:]),
+                hermes_home=home,
+                snapshot_root=snapshot_root,
+            )
+            if windows_target is not None:
+                classification, normalized_candidate = windows_target
+                if classification == "snapshot":
+                    return True
+                if classification == "external":
+                    # This conclusion is entirely lexical. Do not stat or
+                    # resolve the external target.
+                    return False
+                if os.name != "nt":
+                    # A mocked/non-native runtime cannot safely continue a
+                    # Windows alias chain. Mutation callers fail closed.
+                    raise OSError("Windows junction alias requires a Windows runtime")
+                candidate = _normalized_absolute(Path(normalized_candidate))
+                redirected = True
+                break
+
+            target = Path(raw_target)
+            if not target.is_absolute():
+                target = current.parent / target
+            candidate = _normalized_absolute(target.joinpath(*parts[index + 1:]))
+            if _strict_child(candidate, snapshot_root):
+                return True
+            if candidate != home and not _strict_child(candidate, home):
+                # Do not stat or resolve an external target. It is not a
+                # locally provable alias of the private snapshot.
+                return False
+            redirected = True
+            break
+
+        if not redirected:
+            return False
+
+    raise OSError("too many local skill alias hops")
 
 
 def external_skills_roots_fingerprint(roots: Tuple[str, ...]) -> str:
@@ -891,15 +1789,10 @@ def get_gateway_external_skills_snapshot(
     fingerprint = external_skills_roots_fingerprint(roots)
     catalog_path = external_skills_catalog_path(hermes_home)
     try:
-        # The catalog and snapshot parent must be real profile-local
-        # directories/files, not links that can redirect an unattended gateway
-        # onto another filesystem.  is_symlink() uses lstat and does not touch
-        # the target.
-        if catalog_path.parent.is_symlink() or catalog_path.is_symlink():
-            return None
-        catalog_bytes = _read_bounded_regular_file(
+        catalog_bytes = _read_gateway_cache_regular_file(
             catalog_path,
             EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
+            hermes_home=hermes_home,
         )
         payload = json.loads(catalog_bytes.decode("utf-8"))
     except (OSError, UnicodeError, ValueError, TypeError):
@@ -930,13 +1823,20 @@ def get_gateway_external_skills_snapshot(
     if not isinstance(relative_roots, list) or len(relative_roots) != len(roots):
         return None
     snapshot_base = external_skills_snapshot_dir(hermes_home)
+    snapshot_base_fd = -1
     try:
-        if snapshot_base.is_symlink() or not snapshot_base.is_dir():
-            return None
+        snapshot_base_fd = _open_gateway_cache_directory(
+            snapshot_base,
+            hermes_home=hermes_home,
+        )
     except OSError:
         return None
+    finally:
+        if snapshot_base_fd >= 0:
+            os.close(snapshot_base_fd)
 
     result: List[Path] = []
+    result_identities: List[Tuple[int, int]] = []
     generation_relative: Optional[PurePosixPath] = None
     for root_index, raw_relative in enumerate(relative_roots):
         if not isinstance(raw_relative, str) or not raw_relative:
@@ -957,42 +1857,77 @@ def get_gateway_external_skills_snapshot(
         elif candidate_generation != generation_relative:
             return None
         candidate = snapshot_base.joinpath(*relative.parts)
-        current = snapshot_base
+        candidate_fd = -1
         try:
-            # Reject a local pointer that could redirect the gateway back onto
-            # an external filesystem. is_symlink() uses lstat and never follows
-            # the link target; is_dir() runs only after every component passes.
-            for part in relative.parts:
-                current = current / part
-                if current.is_symlink():
-                    return None
-            if not candidate.is_dir():
-                return None
+            candidate_fd = _open_gateway_cache_directory(
+                candidate,
+                hermes_home=hermes_home,
+            )
+            candidate_metadata = os.fstat(candidate_fd)
         except OSError:
             return None
+        finally:
+            if candidate_fd >= 0:
+                os.close(candidate_fd)
         result.append(candidate)
+        result_identities.append(
+            (int(candidate_metadata.st_dev), int(candidate_metadata.st_ino))
+        )
 
     if generation_relative is None:
         return None
     generation = snapshot_base.joinpath(*generation_relative.parts)
-    lease = _acquire_gateway_external_snapshot_lease(generation)
+    lease = _acquire_gateway_external_snapshot_lease(
+        generation,
+        hermes_home=hermes_home,
+    )
     if lease is None:
         return None
     try:
         # The generation may have been retired after validation but before
         # the shared lock was acquired. Revalidate under the lease; from this
         # point a conforming GC cannot obtain its exclusive fence.
-        if generation.is_symlink() or not generation.is_dir():
+        generation_fd = _open_gateway_cache_directory(
+            generation,
+            hermes_home=hermes_home,
+        )
+        try:
+            generation_metadata = os.fstat(generation_fd)
+        finally:
+            os.close(generation_fd)
+        if (
+            int(generation_metadata.st_dev),
+            int(generation_metadata.st_ino),
+        ) != lease.generation_identity:
             lease.close()
             return None
-        for candidate in result:
-            if candidate.is_symlink() or not candidate.is_dir():
+        for candidate, expected_identity in zip(result, result_identities):
+            candidate_fd = _open_gateway_cache_directory(
+                candidate,
+                hermes_home=hermes_home,
+            )
+            try:
+                candidate_metadata = os.fstat(candidate_fd)
+            finally:
+                os.close(candidate_fd)
+            if (
+                int(candidate_metadata.st_dev),
+                int(candidate_metadata.st_ino),
+            ) != expected_identity:
                 lease.close()
                 return None
     except OSError:
         lease.close()
         return None
-    leased_roots = tuple(_LeasedSnapshotPath(path, lease) for path in result)
+    leased_roots = tuple(
+        _LeasedSnapshotPath(
+            path,
+            lease,
+            hermes_home,
+            identity,
+        )
+        for path, identity in zip(result, result_identities)
+    )
     return frozenset(names), leased_roots
 
 
@@ -1510,6 +2445,20 @@ def normalize_skill_lookup_name(identifier: str) -> str:
         except ValueError:
             continue
 
+    if os.environ.get("_HERMES_GATEWAY") == "1":
+        # Gateway identifiers can be retained by channel bindings, bundles,
+        # or preloaded-session configuration after a materialized generation
+        # advances. Never resolve a stale absolute cache path: a substituted
+        # cache ancestor could redirect that fallback into external storage.
+        # Passing the absolute spelling through makes skill_view reject it at
+        # its pre-I/O relative-name gate.
+        logger.debug(
+            "Gateway skill identifier %r is outside current lexical roots; "
+            "refusing pathname resolution",
+            raw_identifier,
+        )
+        return raw_identifier
+
     try:
         return str(identifier_path.resolve().relative_to(primary_root.resolve()))
     except Exception:
@@ -1777,6 +2726,22 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     marker at all) is pruned — leave an org and its skills stop resolving,
     without any manual cleanup.
     """
+    gateway_snapshot_home = getattr(
+        skills_dir,
+        "_external_snapshot_hermes_home",
+        None,
+    )
+    gateway_snapshot_identity = getattr(
+        skills_dir,
+        "_external_snapshot_identity",
+        None,
+    )
+    gateway_snapshot_lease = getattr(
+        skills_dir,
+        "_external_snapshot_lease",
+        None,
+    )
+    gateway_snapshot_root = Path(skills_dir)
     skills_dir_str = str(skills_dir)
     # Foreground Hermes intentionally supports user-created local category
     # symlinks. A gateway is different: it is long-lived and unattended, and
@@ -1785,16 +2750,149 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     follow_directory_symlinks = os.environ.get("_HERMES_GATEWAY") != "1"
     if not follow_directory_symlinks:
         try:
-            if Path(skills_dir).is_symlink():
-                return
+            if gateway_snapshot_home is not None:
+                root_fd = _open_gateway_cache_directory(
+                    Path(skills_dir),
+                    hermes_home=Path(gateway_snapshot_home),
+                    expected_directory=(
+                        gateway_snapshot_root,
+                        gateway_snapshot_identity,
+                    ),
+                )
+                try:
+                    root_metadata = os.fstat(root_fd)
+                finally:
+                    os.close(root_fd)
+                if (
+                    int(root_metadata.st_dev),
+                    int(root_metadata.st_ino),
+                ) != gateway_snapshot_identity:
+                    return
+            else:
+                root_metadata = Path(skills_dir).stat(follow_symlinks=False)
+                if (
+                    path_entry_is_redirect(skills_dir, metadata=root_metadata)
+                    or not stat_module.S_ISDIR(root_metadata.st_mode)
+                ):
+                    return
         except OSError:
             return
-    active_org = read_active_org_id(skills_dir)
+    if follow_directory_symlinks:
+        active_org = read_active_org_id(skills_dir)
+    elif gateway_snapshot_home is not None:
+        # Versioned external snapshots never contain profile org mirrors. More
+        # importantly, do not perform a path-based marker read between the
+        # descriptor validation above and the descriptor-relative walk below.
+        active_org = None
+    else:
+        # Do not read a token marker through a gateway-visible junction before
+        # the walker has had a chance to prune it.
+        org_candidate = Path(skills_dir) / ORG_MIRROR_DIR_NAME
+        try:
+            org_metadata = org_candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            active_org = None
+        except OSError:
+            active_org = None
+        else:
+            try:
+                active_org = (
+                    None
+                    if path_entry_is_redirect(
+                        org_candidate,
+                        metadata=org_metadata,
+                    )
+                    else read_active_org_id(skills_dir)
+                )
+            except OSError:
+                active_org = None
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
+
+    if not follow_directory_symlinks:
+        # os.walk() calls DirEntry.is_dir() while constructing ``dirs``.  On
+        # Python 3.11/Windows that can classify a junction before callers get
+        # a chance to prune it.  Walk gateway roots directly from no-follow
+        # metadata so no reparse target is ever queried.
+        pending = [Path(skills_dir)]
+        while pending:
+            current_root = pending.pop()
+            directories: List[Path] = []
+            regular_files: Set[str] = set()
+            current_fd = -1
+            try:
+                if gateway_snapshot_home is not None:
+                    current_fd = _open_gateway_cache_directory(
+                        current_root,
+                        hermes_home=Path(gateway_snapshot_home),
+                        expected_directory=(
+                            gateway_snapshot_root,
+                            gateway_snapshot_identity,
+                        ),
+                    )
+                    scan_target = current_fd
+                else:
+                    scan_target = current_root
+                with os.scandir(scan_target) as entries:
+                    for entry in entries:
+                        entry_path = current_root / entry.name
+                        try:
+                            metadata = entry.stat(follow_symlinks=False)
+                            if path_entry_is_redirect(
+                                entry_path,
+                                metadata=metadata,
+                            ):
+                                continue
+                        except OSError:
+                            continue
+                        if stat_module.S_ISDIR(metadata.st_mode):
+                            directories.append(entry_path)
+                        elif stat_module.S_ISREG(metadata.st_mode):
+                            regular_files.add(entry.name)
+            except OSError:
+                continue
+            finally:
+                if current_fd >= 0:
+                    os.close(current_fd)
+
+            has_skill_md = "SKILL.md" in regular_files
+            if filename in regular_files:
+                matches.append(str(current_root / filename))
+
+            kept: List[Path] = []
+            for directory_path in directories:
+                directory = directory_path.name
+                if directory in EXCLUDED_SKILL_DIRS or (
+                    has_skill_md and directory in SKILL_SUPPORT_DIRS
+                ):
+                    continue
+                if (
+                    current_root == Path(skills_dir)
+                    and directory == ORG_MIRROR_DIR_NAME
+                    and active_org is None
+                ):
+                    continue
+                if current_root == Path(org_root) and directory != active_org:
+                    continue
+                kept.append(directory_path)
+            pending.extend(reversed(sorted(kept, key=lambda item: item.name)))
+
+        for path in sorted(matches):
+            if gateway_snapshot_home is not None:
+                yield _LeasedSnapshotPath(
+                    Path(path),
+                    gateway_snapshot_lease,
+                    Path(gateway_snapshot_home),
+                    gateway_snapshot_identity,
+                    root=gateway_snapshot_root,
+                )
+            else:
+                yield Path(path)
+        return
+
     for root, dirs, files in os.walk(
         skills_dir_str,
-        followlinks=follow_directory_symlinks,
+        followlinks=True,
     ):
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
@@ -1803,14 +2901,10 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             # Inside _org/: descend ONLY into the active org's mirror.
             dirs[:] = [d for d in dirs if d == active_org]
         dirs[:] = [
-            d
-            for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
-            and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
-            and (
-                follow_directory_symlinks
-                or not os.path.islink(os.path.join(root, d))
-            )
+            directory
+            for directory in dirs
+            if directory not in EXCLUDED_SKILL_DIRS
+            and not (has_skill_md and directory in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:
             matches.append(os.path.join(root, filename))

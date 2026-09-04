@@ -28,7 +28,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from hermes_cli.config import cfg_get
 
-from agent.skill_utils import EXCLUDED_SKILL_DIRS
+from agent.skill_utils import (
+    EXCLUDED_SKILL_DIRS,
+    is_gateway_materialized_snapshot_path,
+)
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
@@ -280,6 +283,14 @@ def get_skills_directory_mount(
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if ext_dir.is_dir():
+                if is_gateway_materialized_snapshot_path(ext_dir):
+                    logger.warning(
+                        "credential_files: gateway external snapshot %s is "
+                        "read-only and will not be exported to a sandbox; "
+                        "load supporting files with skill_view instead",
+                        ext_dir,
+                    )
+                    continue
                 host_path = _safe_skills_path(ext_dir)
                 mounts.append({
                     "host_path": host_path,
@@ -307,6 +318,11 @@ def _safe_skills_path(skills_dir: Path) -> str:
     """Return *skills_dir* if symlink-free, else a sanitized temp copy."""
     global _safe_skills_tempdir
 
+    if is_gateway_materialized_snapshot_path(skills_dir):
+        raise OSError(
+            "gateway external snapshots cannot be exported by pathname"
+        )
+
     symlinks = [p for p in skills_dir.rglob("*") if p.is_symlink()]
     if not symlinks:
         return str(skills_dir)
@@ -330,15 +346,27 @@ def _safe_skills_path(skills_dir: Path) -> str:
     # the sanitized copy is what gets mounted, so it must not carry the
     # bookkeeping trees either. Prune before descending so a multi-GB
     # .curator_backups is never even walked.
-    for dirpath, dirnames, filenames in os.walk(skills_dir):
-        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_SKILL_DIRS)
-        base = Path(dirpath)
-        (safe_dir / base.relative_to(skills_dir)).mkdir(parents=True, exist_ok=True)
-        for name in filenames:
-            item = base / name
-            if item.is_symlink() or not item.is_file():
-                continue
-            shutil.copy2(str(item), str(safe_dir / item.relative_to(skills_dir)))
+    try:
+        for dirpath, dirnames, filenames in os.walk(skills_dir):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in EXCLUDED_SKILL_DIRS
+            )
+            base = Path(dirpath)
+            (safe_dir / base.relative_to(skills_dir)).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            for name in filenames:
+                item = base / name
+                if item.is_symlink() or not item.is_file():
+                    continue
+                shutil.copy2(
+                    str(item),
+                    str(safe_dir / item.relative_to(skills_dir)),
+                )
+    except BaseException:
+        shutil.rmtree(safe_dir, ignore_errors=True)
+        raise
 
     def _cleanup():
         if safe_dir.is_dir():
@@ -364,6 +392,15 @@ def _iter_syncable_files(root: Path):
     Those hold progressive-disclosure support files and bundled scripts the
     sandbox does execute, so they must keep syncing.
     """
+    if is_gateway_materialized_snapshot_path(root):
+        logger.warning(
+            "credential_files: gateway external snapshot %s is read-only "
+            "and will not be uploaded to a sandbox; load supporting files "
+            "with skill_view instead",
+            root,
+        )
+        return
+
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_SKILL_DIRS)
         base = Path(dirpath)
@@ -620,5 +657,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

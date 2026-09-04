@@ -83,6 +83,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    is_gateway_materialized_snapshot_path,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -122,7 +123,17 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             continue
         try:
-            with os.scandir(d) as it:
+            # Gateway materialized roots override Path._scandir() with an
+            # identity-pinned descriptor walk. Calling os.scandir(d) directly
+            # would discard that capability and reopen a substituted cache
+            # ancestor by pathname. Ordinary roots use the public API: newer
+            # pathlib releases do not expose Path._scandir().
+            scan = (
+                d._scandir()
+                if is_gateway_materialized_snapshot_path(d)
+                else os.scandir(d)
+            )
+            with scan as it:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
@@ -1367,7 +1378,17 @@ def skill_view(
                 candidates = project_candidates
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            def _candidate_display_path(smd: Path) -> str:
+                if not is_gateway_materialized_snapshot_path(smd):
+                    return str(smd)
+                guarded_root = getattr(smd, "_external_snapshot_root", None)
+                try:
+                    relative = smd.relative_to(guarded_root)
+                except (TypeError, ValueError):
+                    return "external:<guarded-snapshot>"
+                return f"external:{relative}"
+
+            paths = [_candidate_display_path(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
@@ -1441,6 +1462,15 @@ def skill_view(
                 },
                 ensure_ascii=False,
             )
+
+        # A gateway materialization is safe to read only while its
+        # descriptor-backed path capability is retained.  Never serialize the
+        # cache path for a later plain-Path reopen: a catalog swap between the
+        # view and that later use could redirect preprocessing, telemetry, or
+        # an emitted script path.  These views stay fully readable through
+        # skill_view (including linked files), but path-based conveniences are
+        # deliberately disabled.
+        guarded_snapshot = is_gateway_materialized_snapshot_path(skill_md)
 
         # Read the file once — reused for platform check and main content below
         try:
@@ -1619,19 +1649,25 @@ def skill_view(
                     exc_info=True,
                 )
 
-            return json.dumps(
-                {
-                    "success": True,
-                    "name": name,
-                    "file": file_path,
-                    "content": content,
-                    "file_type": target_file.suffix,
-                    # Internal: absolute source path for the repeat-view dedup
-                    # fingerprint (mtime+size change detection).
-                    "_source_path": str(target_file),
-                },
-                ensure_ascii=False,
-            )
+            file_result = {
+                "success": True,
+                "name": name,
+                "file": file_path,
+                "content": content,
+                "file_type": target_file.suffix,
+            }
+            if guarded_snapshot:
+                file_result["path_features_disabled"] = True
+                file_result["path_access_note"] = (
+                    "Gateway external snapshots are read through a pinned "
+                    "capability; absolute paths and repeat-view path telemetry "
+                    "are disabled."
+                )
+            else:
+                # Internal: absolute source path for repeat-view dedup
+                # fingerprinting (mtime+size change detection).
+                file_result["_source_path"] = str(target_file)
+            return json.dumps(file_result, ensure_ascii=False)
 
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
@@ -1781,12 +1817,26 @@ def skill_view(
         rendered_content = content
         if preprocess:
             try:
-                from agent.skill_preprocessing import preprocess_skill_content
+                from agent.skill_preprocessing import (
+                    load_skills_config,
+                    preprocess_skill_content,
+                )
+
+                preprocessing_dir = skill_dir
+                preprocessing_config = None
+                if guarded_snapshot:
+                    # Keep session-id template substitution, but leave
+                    # HERMES_SKILL_DIR unresolved and never run an inline
+                    # command with a cache path as cwd.
+                    preprocessing_dir = None
+                    preprocessing_config = dict(load_skills_config())
+                    preprocessing_config["inline_shell"] = False
 
                 rendered_content = preprocess_skill_content(
                     content,
-                    skill_dir,
+                    preprocessing_dir,
                     session_id=task_id,
+                    skills_cfg=preprocessing_config,
                 )
             except Exception:
                 logger.debug(
@@ -1868,7 +1918,11 @@ def skill_view(
             "related_skills": related_skills,
             "content": rendered_content,
             "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "skill_dir": (
+                str(skill_dir)
+                if skill_dir and not guarded_snapshot
+                else None
+            ),
             "org_provenance": org_provenance,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
@@ -1884,10 +1938,19 @@ def skill_view(
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
-            # Internal: absolute source path for the repeat-view dedup
-            # fingerprint (mtime+size change detection).
-            "_source_path": str(skill_md),
         }
+        if guarded_snapshot:
+            result["path_features_disabled"] = True
+            result["path_access_note"] = (
+                "Gateway external snapshots are read through a pinned "
+                "capability. Load linked files with skill_view; absolute "
+                "directory hints, HERMES_SKILL_DIR expansion, inline shell, "
+                "and repeat-view path telemetry are disabled."
+            )
+        else:
+            # Internal: absolute source path for repeat-view dedup
+            # fingerprinting (mtime+size change detection).
+            result["_source_path"] = str(skill_md)
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:

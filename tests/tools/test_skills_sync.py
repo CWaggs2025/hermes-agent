@@ -7,6 +7,7 @@ import os
 import stat
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.skills_sync import (
@@ -476,6 +477,278 @@ class TestExternalDirsIndexing:
 
         assert target.read_text(encoding="utf-8") == "sentinel\n"
 
+    def test_redirected_cache_blocks_lock_work_index_publish_and_cleanup(
+        self,
+        tmp_path,
+    ):
+        """A planted cache symlink is rejected before any target-side effect."""
+        import tools.skills_sync as skills_sync_module
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        remote = tmp_path / "remote-cache"
+        remote.mkdir()
+        (remote / "external-skills-catalog.json").write_text(
+            json.dumps(
+                {
+                    "version": skills_sync_module._EXTERNAL_CATALOG_VERSION,
+                    "roots_fingerprint": "remote",
+                    "names": ["must-not-be-read"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        remote_work = remote / ".external-scan-sentinel"
+        remote_work.mkdir()
+        (remote_work / "keep.txt").write_text("keep", encoding="utf-8")
+        try:
+            (hermes_home / "cache").symlink_to(remote, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks are unavailable")
+
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home), patch(
+            "tools.skills_sync.os.scandir",
+            side_effect=AssertionError("scanner enumerated redirected cache"),
+        ) as scandir:
+            assert skills_sync_module._read_json_object(
+                skills_sync_module._external_catalog_cache_path()
+            ) is None
+            assert skills_sync_module._try_acquire_external_scan_file_lock() is None
+            with pytest.raises(OSError):
+                skills_sync_module._create_external_scan_work_dir(
+                    hermes_home / "cache"
+                )
+            with pytest.raises(OSError):
+                skills_sync_module._list_external_snapshot_generations()
+            with pytest.raises(OSError):
+                skills_sync_module._write_json_object_atomic(
+                    skills_sync_module._external_catalog_cache_path(),
+                    {"ok": True},
+                )
+            skills_sync_module._safe_cleanup_external_scan_work_dir(
+                str(hermes_home / "cache" / remote_work.name),
+                str(hermes_home / "cache"),
+            )
+
+        scandir.assert_not_called()
+        assert not (remote / "external-skills-scan.lock").exists()
+        assert not list(remote.glob(".external-scan-*tmp*"))
+        assert (remote_work / "keep.txt").read_text(encoding="utf-8") == "keep"
+        assert "must-not-be-read" in (
+            remote / "external-skills-catalog.json"
+        ).read_text(encoding="utf-8")
+
+    def test_redirected_snapshot_root_blocks_publish_index_and_delete(self, tmp_path):
+        """Nested cache redirects cannot publish, enumerate, or delete remotely."""
+        import tools.skills_sync as skills_sync_module
+
+        if not skills_sync_module._external_fd_traversal_supported():
+            pytest.skip("descriptor-relative snapshot operations are unavailable")
+        hermes_home = tmp_path / "hermes"
+        cache = hermes_home / "cache"
+        cache.mkdir(parents=True)
+        remote_snapshots = tmp_path / "remote-snapshots"
+        generation_target = remote_snapshots / "fp" / "gen"
+        generation_target.mkdir(parents=True)
+        sentinel = generation_target / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        snapshot_link = cache / "external-skills-snapshots"
+        try:
+            snapshot_link.symlink_to(remote_snapshots, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks are unavailable")
+        staging = cache / ".external-scan-staging" / "materialized"
+        staging.mkdir(parents=True)
+        generation = skills_sync_module._ExternalSnapshotGeneration(
+            snapshot_link / "fp" / "gen",
+            1,
+            1,
+            complete=True,
+        )
+
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+            with pytest.raises(OSError):
+                skills_sync_module._list_external_snapshot_generations()
+            with pytest.raises(OSError):
+                skills_sync_module._publish_external_materialized_generation(
+                    staging,
+                    fingerprint="new-fingerprint",
+                    scan_id="new-generation",
+                )
+            assert not skills_sync_module._remove_external_snapshot_generation(
+                generation
+            )
+
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert not (remote_snapshots / "new-fingerprint").exists()
+
+    def test_runtime_without_cache_dirfd_support_has_no_cache_side_effects(
+        self,
+        tmp_path,
+    ):
+        """A safe-looking cache still fails closed without handle-relative I/O."""
+        import tools.skills_sync as skills_sync_module
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        cache = hermes_home / "cache"
+
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home), patch(
+            "tools.skills_sync._external_cache_dirfd_supported",
+            return_value=False,
+        ), patch(
+            "tools.skills_sync.os.open",
+            side_effect=AssertionError("unsupported runtime opened cache state"),
+        ) as open_file, patch(
+            "tools.skills_sync.os.mkdir",
+            side_effect=AssertionError("unsupported runtime created cache state"),
+        ) as mkdir, patch(
+            "tools.skills_sync.os.scandir",
+            side_effect=AssertionError("unsupported runtime scanned cache state"),
+        ) as scandir, patch(
+            "tools.skills_sync.shutil.rmtree",
+            side_effect=AssertionError("unsupported runtime deleted cache state"),
+        ) as remove:
+            with pytest.raises(
+                OSError,
+                match="race-safe descriptor-relative scanner cache access is unavailable",
+            ):
+                skills_sync_module._create_external_scan_work_dir(cache)
+
+        open_file.assert_not_called()
+        mkdir.assert_not_called()
+        scandir.assert_not_called()
+        remove.assert_not_called()
+        assert not cache.exists()
+
+    def test_materialization_stays_on_open_cache_after_lexical_parent_swap(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A cache-path swap after safe open cannot redirect a copied file."""
+        import tools.skills_sync as skills_sync_module
+
+        if not skills_sync_module._external_cache_dirfd_supported():
+            pytest.skip("descriptor-relative cache operations are unavailable")
+
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "SKILL.md").write_text(
+            "---\nname: pinned-cache-copy\n---\n",
+            encoding="utf-8",
+        )
+        hermes_home = tmp_path / "hermes"
+        cache = hermes_home / "cache"
+        remote = tmp_path / "remote-cache"
+        remote.mkdir()
+        detached = hermes_home / "cache-detached"
+
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+            work_dir = skills_sync_module._create_external_scan_work_dir(cache)
+            materialized_root = work_dir / "materialized"
+            package_destination = materialized_root / "root-0000"
+            original_open = skills_sync_module._open_external_cache_directory
+            target_opens = 0
+            swapped = False
+
+            def swap_after_safe_open(path, *, create=False, hermes_home=None):
+                nonlocal target_opens, swapped
+                descriptor = original_open(
+                    path,
+                    create=create,
+                    hermes_home=hermes_home,
+                )
+                if Path(path) == package_destination:
+                    target_opens += 1
+                    if target_opens == 2:
+                        cache.rename(detached)
+                        cache.symlink_to(remote, target_is_directory=True)
+                        swapped = True
+                return descriptor
+
+            monkeypatch.setattr(
+                skills_sync_module,
+                "_open_external_cache_directory",
+                swap_after_safe_open,
+            )
+            try:
+                names = skills_sync_module._scan_external_roots_fd(
+                    (str(external),),
+                    materialized_root,
+                )
+            finally:
+                if cache.is_symlink():
+                    cache.unlink()
+                    detached.rename(cache)
+
+        assert swapped
+        assert "pinned-cache-copy" in names
+        assert (package_destination / "SKILL.md").is_file()
+        assert list(remote.iterdir()) == []
+
+    def test_windows_reparse_cache_parent_blocks_all_path_fallbacks(self, tmp_path):
+        """Python 3.11 junction metadata fails before path-based cache I/O."""
+        import tools.skills_sync as skills_sync_module
+
+        hermes_home = tmp_path / "hermes"
+        cache = hermes_home / "cache"
+        cache.mkdir(parents=True)
+        remote_work = cache / ".external-scan-sentinel"
+        remote_work.mkdir()
+        (remote_work / "keep.txt").write_text("keep", encoding="utf-8")
+        real_stat = Path.stat
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        def mocked_stat(path, *args, **kwargs):
+            if Path(path) == cache and kwargs.get("follow_symlinks") is False:
+                return reparse_metadata
+            return real_stat(path, *args, **kwargs)
+
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home), patch.object(
+            Path,
+            "stat",
+            mocked_stat,
+        ), patch(
+            "tools.skills_sync._external_cache_dirfd_supported",
+            return_value=False,
+        ), patch(
+            "tools.skills_sync.os.open",
+            side_effect=AssertionError("fallback opened through junction"),
+        ) as open_file, patch(
+            "tools.skills_sync.os.scandir",
+            side_effect=AssertionError("fallback scanned through junction"),
+        ) as scandir, patch(
+            "tools.skills_sync.tempfile.mkdtemp",
+            side_effect=AssertionError("fallback created remote work"),
+        ) as mkdtemp, patch(
+            "tools.skills_sync.shutil.rmtree",
+            side_effect=AssertionError("fallback deleted remote work"),
+        ) as remove:
+            assert skills_sync_module._try_acquire_external_scan_file_lock() is None
+            with pytest.raises(OSError, match="ancestry is redirected"):
+                skills_sync_module._create_external_scan_work_dir(cache)
+            with pytest.raises(OSError, match="ancestry is redirected"):
+                skills_sync_module._list_external_snapshot_generations()
+            with pytest.raises(OSError, match="ancestry is redirected"):
+                skills_sync_module._write_json_object_atomic(
+                    skills_sync_module._external_catalog_cache_path(),
+                    {"ok": True},
+                )
+            skills_sync_module._safe_cleanup_external_scan_work_dir(
+                str(remote_work),
+                str(cache),
+            )
+
+        open_file.assert_not_called()
+        scandir.assert_not_called()
+        mkdtemp.assert_not_called()
+        remove.assert_not_called()
+        assert (remote_work / "keep.txt").read_text(encoding="utf-8") == "keep"
+
     def test_snapshot_retention_bounds_complete_generation_count_and_bytes(
         self, tmp_path, monkeypatch
     ):
@@ -587,6 +860,259 @@ class TestExternalDirsIndexing:
         assert previous.is_dir()
         assert current.is_dir()
 
+    def test_gateway_lease_cache_swap_cannot_create_remote_lock(self, tmp_path):
+        """The gateway descends from HERMES_HOME before creating a read lease."""
+        from agent import skill_utils
+        import tools.skills_sync as skills_sync_module
+
+        if not skill_utils._gateway_cache_dirfd_supported():
+            pytest.skip("descriptor-relative gateway cache access is unavailable")
+
+        hermes_home = tmp_path / "hermes"
+        cache = hermes_home / "cache"
+        detached = hermes_home / "cache-detached"
+        remote = tmp_path / "remote-cache"
+        roots = (str(tmp_path / "external"),)
+        fingerprint = skills_sync_module._external_catalog_fingerprint(roots)
+        generation_name = "1-aaaaaaaaaaaaaaaa"
+
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+            self._seed_snapshot_generation(
+                skills_sync_module,
+                fingerprint,
+                generation_name,
+            )
+            skills_sync_module._publish_external_catalog_snapshot(
+                fingerprint,
+                roots,
+                {"external"},
+                (f"{fingerprint}/{generation_name}/root-0000",),
+            )
+        shutil.copytree(cache, remote)
+
+        original_acquire = skill_utils._acquire_gateway_external_snapshot_lease
+        swapped = False
+
+        def swap_before_lease(generation, *, hermes_home):
+            nonlocal swapped
+            cache.rename(detached)
+            cache.symlink_to(remote, target_is_directory=True)
+            swapped = True
+            return original_acquire(
+                generation,
+                hermes_home=hermes_home,
+            )
+
+        try:
+            with patch.object(
+                skill_utils,
+                "_acquire_gateway_external_snapshot_lease",
+                swap_before_lease,
+            ):
+                snapshot = skill_utils.get_gateway_external_skills_snapshot(
+                    roots,
+                    hermes_home=hermes_home,
+                )
+        finally:
+            if cache.is_symlink():
+                cache.unlink()
+                detached.rename(cache)
+
+        assert swapped
+        assert snapshot is None
+        remote_lease = (
+            remote
+            / "external-skills-snapshots"
+            / fingerprint
+            / f".{generation_name}{skill_utils.EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX}"
+        )
+        assert not remote_lease.exists()
+
+    @pytest.mark.parametrize("minor", [12, 13])
+    def test_gateway_snapshot_reader_fails_closed_on_newer_pathlib(
+        self,
+        tmp_path,
+        minor,
+    ):
+        """Python 3.12/3.13 must not use the 3.11 private Path capability."""
+        from agent import skill_utils
+
+        roots = (str(tmp_path / "external-never-touched"),)
+        with patch.object(
+            skill_utils.sys,
+            "version_info",
+            (3, minor, 0),
+        ), patch.object(
+            skill_utils.os,
+            "open",
+        ) as raw_open:
+            assert not skill_utils._gateway_cache_dirfd_supported()
+            assert (
+                skill_utils.get_gateway_external_skills_snapshot(
+                    roots,
+                    hermes_home=tmp_path / "hermes",
+                )
+                is None
+            )
+        raw_open.assert_not_called()
+
+    def test_gateway_snapshot_reader_fails_closed_on_unknown_pathlib_runtime(
+        self,
+    ):
+        """The private 3.11 capability is restricted to its tested runtime."""
+        from agent import skill_utils
+
+        with patch.object(
+            skill_utils.sys,
+            "implementation",
+            SimpleNamespace(name="other-python"),
+        ):
+            assert not skill_utils._gateway_cache_dirfd_supported()
+
+    def test_gateway_yielded_skill_file_refuses_post_scan_cache_swap(
+        self,
+        tmp_path,
+    ):
+        """The consumer's final read remains anchored after iterator yield."""
+        from agent import skill_utils
+        import tools.skills_sync as skills_sync_module
+
+        if not skill_utils._gateway_cache_dirfd_supported():
+            pytest.skip("descriptor-relative gateway cache access is unavailable")
+
+        hermes_home = tmp_path / "hermes"
+        cache = hermes_home / "cache"
+        detached = hermes_home / "cache-detached"
+        remote = tmp_path / "remote-cache"
+        roots = (str(tmp_path / "external"),)
+        fingerprint = skills_sync_module._external_catalog_fingerprint(roots)
+        generation_name = "1-bbbbbbbbbbbbbbbb"
+        with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+            generation = self._seed_snapshot_generation(
+                skills_sync_module,
+                fingerprint,
+                generation_name,
+            )
+            local_skill = generation / "root-0000" / "example" / "SKILL.md"
+            local_skill.parent.mkdir()
+            local_skill.write_text("LOCAL\n", encoding="utf-8")
+            skills_sync_module._publish_external_catalog_snapshot(
+                fingerprint,
+                roots,
+                {"example"},
+                (f"{fingerprint}/{generation_name}/root-0000",),
+            )
+        snapshot = skill_utils.get_gateway_external_skills_snapshot(
+            roots,
+            hermes_home=hermes_home,
+        )
+        assert snapshot is not None
+        root = snapshot[1][0]
+        with patch.dict(os.environ, {"_HERMES_GATEWAY": "1"}):
+            matched = next(skill_utils.iter_skill_index_files(root, "SKILL.md"))
+        derived = root / "example" / "SKILL.md"
+        assert derived.read_text(encoding="utf-8") == "LOCAL\n"
+        assert [path.relative_to(root) for path in root.rglob("SKILL.md")] == [
+            Path("example/SKILL.md")
+        ]
+
+        shutil.copytree(cache, remote)
+        remote_skill = (
+            remote
+            / "external-skills-snapshots"
+            / fingerprint
+            / generation_name
+            / "root-0000"
+            / "example"
+            / "SKILL.md"
+        )
+        remote_skill.write_text("REMOTE\n", encoding="utf-8")
+        (remote_skill.parent / "REMOTE_ONLY.md").write_text(
+            "REMOTE ONLY\n",
+            encoding="utf-8",
+        )
+        cache.rename(detached)
+        cache.symlink_to(remote, target_is_directory=True)
+        try:
+            with pytest.raises(OSError):
+                matched.read_text(encoding="utf-8")
+            with pytest.raises(OSError):
+                derived.read_text(encoding="utf-8")
+            assert list(root.rglob("REMOTE_ONLY.md")) == []
+            assert not root.exists()
+            with pytest.raises(OSError, match="read-only"):
+                (root / "example" / "REMOTE_ONLY.md").unlink()
+            with pytest.raises(OSError, match="read-only"):
+                (root / "remote-created").mkdir()
+            with pytest.raises(OSError, match="read-only"):
+                (root / "example" / "REMOTE_ONLY.md").write_text(
+                    "changed\n",
+                    encoding="utf-8",
+                )
+        finally:
+            cache.unlink()
+            detached.rename(cache)
+
+        assert matched.read_text(encoding="utf-8") == "LOCAL\n"
+        assert derived.read_text(encoding="utf-8") == "LOCAL\n"
+        assert remote_skill.read_text(encoding="utf-8") == "REMOTE\n"
+        assert (remote_skill.parent / "REMOTE_ONLY.md").read_text(
+            encoding="utf-8"
+        ) == "REMOTE ONLY\n"
+        assert not (remote / "remote-created").exists()
+
+        from tools import skills_tool
+
+        with patch.object(
+            skills_tool,
+            "_skills_dir",
+            return_value=tmp_path / "empty-local-skills",
+        ), patch(
+            "agent.skill_utils.get_project_skills_dirs",
+            return_value=[],
+        ), patch(
+            "agent.skill_utils.get_external_skills_dirs",
+            return_value=[root],
+        ), patch.dict(
+            os.environ,
+            {"_HERMES_GATEWAY": "1"},
+        ):
+            loaded = json.loads(skills_tool.skill_view("example", preprocess=False))
+
+        assert loaded["success"] is True
+        assert loaded["content"] == "LOCAL\n"
+
+        original_guarded_stat = type(root).stat
+        signature_swapped = False
+
+        def swap_after_signature_stat(path, *, follow_symlinks=True):
+            nonlocal signature_swapped
+            metadata = original_guarded_stat(
+                path,
+                follow_symlinks=follow_symlinks,
+            )
+            if str(path) == str(root) and not signature_swapped:
+                cache.rename(detached)
+                cache.symlink_to(remote, target_is_directory=True)
+                signature_swapped = True
+            return metadata
+
+        try:
+            with patch.object(
+                type(root),
+                "stat",
+                swap_after_signature_stat,
+            ):
+                signature = skills_tool._skills_scan_signature([root], set())
+        finally:
+            if cache.is_symlink():
+                cache.unlink()
+                detached.rename(cache)
+
+        assert signature_swapped
+        assert signature[0][0][0] == str(root)
+        assert (remote_skill.parent / "REMOTE_ONLY.md").is_file()
+
     def test_snapshot_gc_rereads_pointer_before_quarantine(
         self, tmp_path, monkeypatch
     ):
@@ -658,7 +1184,7 @@ class TestExternalDirsIndexing:
                 skills_sync_module, "_MAX_EXTERNAL_SNAPSHOT_GENERATIONS", 2
             )
             with patch(
-                "tools.skills_sync.shutil.rmtree",
+                "tools.skills_sync._remove_external_cache_tree",
                 side_effect=OSError("simulated cleanup failure"),
             ):
                 assert not skills_sync_module._enforce_external_snapshot_retention()
@@ -1450,6 +1976,8 @@ class TestSyncSkills:
 
         with self._patches(bundled, skills_dir, manifest_file):
             def failing_copytree(src, dst, *a, **kw):
+                Path(dst).mkdir(parents=True, exist_ok=True)
+                (Path(dst) / "PARTIAL").write_text("incomplete")
                 raise OSError("Simulated disk full")
 
             with patch("shutil.copytree", side_effect=failing_copytree):
@@ -1463,6 +1991,9 @@ class TestSyncSkills:
             assert "new-skill" not in _read_manifest(), (
                 "Failed copy was recorded in manifest — next sync will "
                 "treat it as 'user deleted' and never retry"
+            )
+            assert not list(skills_dir.rglob(".bundled-sync-staging")), (
+                "failed private copies must be cleaned without becoming visible"
             )
 
             # Now run sync again (copytree works this time) — it should retry.
@@ -1879,12 +2410,232 @@ class TestUpdateBackupRecovery:
         assert (dest / "SKILL.md").read_text() == "# Old v1"
         assert not (dest / "PARTIAL").exists()
         assert not (skills_dir / "old-skill.bak").exists()
+        assert not list(skills_dir.rglob(".bundled-sync-staging"))
 
         # And the skill is not wedged: a later normal sync updates cleanly.
         with self._patches(bundled, skills_dir, manifest_file):
             result2 = sync_skills(quiet=True)
         assert "old-skill" in result2["updated"]
         assert result2["user_modified"] == []
+
+    def test_completed_promotion_with_stale_manifest_is_reconciled(self, tmp_path):
+        """A crash after atomic rename must not wedge the new copy as edited."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        dest = self._seed_synced_copy(skills_dir, manifest_file)
+        backup = skills_dir / "old-skill.bak"
+        shutil.copytree(dest, backup)
+        shutil.rmtree(dest)
+        shutil.copytree(bundled / "old-skill", dest)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+            recorded = _read_manifest()["old-skill"]
+
+        assert recorded == _dir_hash(bundled / "old-skill")
+        assert "old-skill" in result["updated"]
+        assert result["user_modified"] == []
+        assert not backup.exists()
+
+    def test_manifest_commit_failure_retains_backup_until_recovery(self, tmp_path):
+        """A failed commit must not erase the only interrupted-update receipt."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        dest = self._seed_synced_copy(skills_dir, manifest_file)
+        old_manifest = manifest_file.read_bytes()
+        backup = skills_dir / "old-skill.bak"
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.atomic_write_text",
+            side_effect=OSError("simulated manifest fsync failure"),
+        ):
+            result = sync_skills(quiet=True)
+
+        assert "old-skill" in result["updated"]
+        assert (dest / "SKILL.md").read_text() == "# Old v2 (updated)"
+        assert backup.is_dir()
+        assert (backup / "SKILL.md").read_text() == "# Old v1"
+        assert manifest_file.read_bytes() == old_manifest
+
+        # The next successful run recognizes the complete promotion, commits
+        # the new hash, and only then retires the retained backup.
+        with self._patches(bundled, skills_dir, manifest_file):
+            recovered = sync_skills(quiet=True)
+            recorded = _read_manifest()["old-skill"]
+
+        assert "old-skill" in recovered["updated"]
+        assert recorded == _dir_hash(bundled / "old-skill")
+        assert not backup.exists()
+
+    def test_promotion_receipt_survives_bundle_advancing_before_recovery(
+        self,
+        tmp_path,
+    ):
+        """A v3 bundle must not make a complete uncommitted v2 look edited."""
+        import tools.skills_sync as skills_sync_module
+
+        bundled, skills_dir, manifest_file = self._setup(
+            tmp_path,
+            bundled_text="# Bundled v2",
+        )
+        dest = self._seed_synced_copy(
+            skills_dir,
+            manifest_file,
+            text="# Bundled v1",
+        )
+        v1_hash = _dir_hash(dest)
+        backup = skills_dir / "old-skill.bak"
+        receipt = skills_sync_module._bundled_promotion_receipt_path(dest)
+
+        def recorded_hash():
+            with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+                return _read_manifest()["old-skill"]
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.atomic_write_text",
+            side_effect=OSError("simulated manifest fsync failure"),
+        ):
+            first = sync_skills(quiet=True)
+
+        v2_hash = _dir_hash(dest)
+        assert "old-skill" in first["updated"]
+        assert v2_hash != v1_hash
+        assert backup.is_dir()
+        assert receipt.is_file()
+        assert recorded_hash() == v1_hash
+
+        # The packaged source advances before the next process gets a chance
+        # to reconcile the failed v2 manifest commit.
+        (bundled / "old-skill" / "SKILL.md").write_text("# Bundled v3")
+        v3_hash = _dir_hash(bundled / "old-skill")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            recovered = sync_skills(quiet=True)
+
+        assert "old-skill" in recovered["updated"]
+        assert _dir_hash(dest) == v2_hash
+        assert recorded_hash() == v2_hash
+        assert not backup.exists()
+        assert not receipt.exists()
+
+        # With v2 durably baselined, the normal atomic update can now install
+        # v3 without classifying v2 as a user edit.
+        with self._patches(bundled, skills_dir, manifest_file):
+            advanced = sync_skills(quiet=True)
+
+        assert "old-skill" in advanced["updated"]
+        assert advanced["user_modified"] == []
+        assert _dir_hash(dest) == v3_hash
+        assert recorded_hash() == v3_hash
+        assert not backup.exists()
+        assert not receipt.exists()
+
+    def test_sync_cleans_only_stale_owned_staging_entries(self, tmp_path):
+        """SIGKILL debris is bounded and fresh/concurrent staging survives."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        staging_root = skills_dir / ".bundled-sync-staging"
+        stale = staging_root / "old-skill.tmp-staleowned"
+        fresh = staging_root / "old-skill.tmp-freshowned"
+        unknown = staging_root / "operator-note"
+        for path in (stale, fresh, unknown):
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "PARTIAL").write_text("preserve only when appropriate")
+        old = 1_000_000.0
+        os.utime(stale, (old, old))
+        os.utime(unknown, (old, old))
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.time.time",
+            return_value=old + 2 * 24 * 60 * 60,
+        ):
+            sync_skills(quiet=True)
+
+        assert not stale.exists()
+        assert fresh.is_dir()
+        assert unknown.is_dir()
+
+    def test_staging_cleanup_refuses_windows_reparse_root(self, tmp_path):
+        """Python 3.11 Windows junctions must not be enumerated as staging."""
+        import tools.skills_sync as skills_sync_module
+
+        _bundled, skills_dir, _manifest_file = self._setup(tmp_path)
+        staging_root = skills_dir / ".bundled-sync-staging"
+        staging_root.mkdir()
+        real_stat = Path.stat
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_mtime=0.0,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        def mocked_stat(path, *args, **kwargs):
+            if Path(path) == staging_root and kwargs.get("follow_symlinks") is False:
+                return reparse_metadata
+            return real_stat(path, *args, **kwargs)
+
+        with patch("tools.skills_sync.SKILLS_DIR", skills_dir), patch.object(
+            Path,
+            "stat",
+            mocked_stat,
+        ), patch(
+            "tools.skills_sync.os.scandir",
+            side_effect=AssertionError("cleanup traversed reparse staging root"),
+        ) as scandir:
+            assert (
+                skills_sync_module._cleanup_stale_bundled_sync_staging(
+                    staging_root,
+                    now=100_000.0,
+                )
+                == 0
+            )
+
+        scandir.assert_not_called()
+
+    def test_staging_cleanup_preserves_windows_reparse_entry(self, tmp_path):
+        """A reparse child is never handed to recursive deletion."""
+        import tools.skills_sync as skills_sync_module
+
+        _bundled, skills_dir, _manifest_file = self._setup(tmp_path)
+        staging_root = skills_dir / ".bundled-sync-staging"
+        staging_root.mkdir()
+        entry_path = staging_root / "old-skill.tmp-reparse"
+        entry_path.mkdir()
+
+        class ReparseEntry:
+            name = entry_path.name
+            path = str(entry_path)
+
+            @staticmethod
+            def stat(*, follow_symlinks):
+                assert follow_symlinks is False
+                return SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o700,
+                    st_mtime=0.0,
+                    st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                )
+
+        class Entries:
+            def __enter__(self):
+                return iter((ReparseEntry(),))
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch("tools.skills_sync.SKILLS_DIR", skills_dir), patch(
+            "tools.skills_sync.os.scandir",
+            return_value=Entries(),
+        ), patch(
+            "tools.skills_sync._rmtree_writable",
+            side_effect=AssertionError("cleanup deleted a reparse entry"),
+        ) as remove:
+            assert (
+                skills_sync_module._cleanup_stale_bundled_sync_staging(
+                    staging_root,
+                    now=100_000.0,
+                )
+                == 0
+            )
+
+        remove.assert_not_called()
+        assert entry_path.is_dir()
 
 
 class TestCallTimeDirResolution:

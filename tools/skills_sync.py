@@ -69,6 +69,8 @@ from agent.skill_utils import (
     get_gateway_external_skills_snapshot,
     get_external_skills_scan_settings,
     is_excluded_skill_path,
+    path_entry_is_redirect,
+    path_has_redirected_component,
     _read_bounded_regular_file,
 )
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -159,6 +161,11 @@ _EXTERNAL_SCAN_BACKOFF_BASE_SECONDS = 10.0
 _EXTERNAL_SCAN_BACKOFF_MAX_SECONDS = 300.0
 _EXTERNAL_CATALOG_VERSION = EXTERNAL_SKILLS_CATALOG_VERSION
 _EXTERNAL_SCAN_THREAD_LOCK = threading.Lock()
+_BUNDLED_SYNC_STAGING_DIR = ".bundled-sync-staging"
+_BUNDLED_SYNC_STAGING_STALE_SECONDS = 24 * 60 * 60
+_MAX_BUNDLED_SYNC_STAGING_CLEANUP_ENTRIES = 64
+_BUNDLED_PROMOTION_RECEIPT_VERSION = 1
+_MAX_BUNDLED_PROMOTION_RECEIPT_BYTES = 4096
 
 
 class ExternalSkillIndex(set):
@@ -254,12 +261,321 @@ def _external_empty_confirmation_path() -> Path:
     return _hermes_home() / "cache" / "external-skills-empty-confirmation.json"
 
 
+def _normalized_local_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _external_cache_root(*, hermes_home: Optional[Path] = None) -> Path:
+    return _normalized_local_path(Path(hermes_home or _hermes_home()) / "cache")
+
+
+def _external_cache_relative_parts(
+    path: Path,
+    *,
+    hermes_home: Optional[Path] = None,
+) -> Tuple[str, ...]:
+    """Return a scanner-cache-relative lexical path or fail closed."""
+    cache_root = _external_cache_root(hermes_home=hermes_home)
+    candidate = _normalized_local_path(path)
+    cache_text = os.path.normcase(str(cache_root))
+    candidate_text = os.path.normcase(str(candidate))
+    try:
+        if os.path.commonpath((cache_text, candidate_text)) != cache_text:
+            raise OSError(f"scanner path escapes HERMES_HOME cache: {path}")
+        relative = os.path.relpath(str(candidate), str(cache_root))
+    except ValueError as exc:
+        raise OSError(f"scanner path escapes HERMES_HOME cache: {path}") from exc
+    if relative in ("", os.curdir):
+        return ()
+    parts = Path(relative).parts
+    if any(part in ("", os.curdir, os.pardir) for part in parts):
+        raise OSError(f"scanner path escapes HERMES_HOME cache: {path}")
+    return tuple(parts)
+
+
+def _is_external_cache_path(path: Path) -> bool:
+    try:
+        _external_cache_relative_parts(path)
+    except OSError:
+        return False
+    return True
+
+
+def _assert_external_cache_ancestry(
+    path: Path,
+    *,
+    allow_missing: bool = False,
+    hermes_home: Optional[Path] = None,
+) -> None:
+    """Inspect every local component from HERMES_HOME without following it."""
+    home = _normalized_local_path(Path(hermes_home or _hermes_home()))
+    candidate = _normalized_local_path(path)
+    _external_cache_relative_parts(candidate, hermes_home=home)
+    if path_has_redirected_component(
+        candidate,
+        root=home,
+        allow_missing=allow_missing,
+    ):
+        raise OSError(f"external scanner cache ancestry is redirected: {path}")
+
+
+def _external_cache_dirfd_supported() -> bool:
+    return (
+        os.name != "nt"
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and os.open in getattr(os, "supports_dir_fd", ())
+        and os.mkdir in getattr(os, "supports_dir_fd", ())
+        and os.stat in getattr(os, "supports_dir_fd", ())
+        and os.unlink in getattr(os, "supports_dir_fd", ())
+        and os.rmdir in getattr(os, "supports_dir_fd", ())
+        and os.rename in getattr(os, "supports_dir_fd", ())
+        and os.scandir in getattr(os, "supports_fd", ())
+    )
+
+
+def _open_external_cache_directory(
+    path: Path,
+    *,
+    create: bool = False,
+    hermes_home: Optional[Path] = None,
+) -> int:
+    """Open a cache directory after bounded no-follow ancestry validation.
+
+    Descriptor-capable POSIX runtimes create and descend one component at a
+    time from the filesystem anchor. Windows/Python 3.11 cannot do that, so it
+    validates observed ancestry for a useful diagnostic and then fails closed
+    without any cache read, write, creation, enumeration, or deletion.
+    """
+    home = _normalized_local_path(Path(hermes_home or _hermes_home()))
+    candidate = _normalized_local_path(path)
+    cache_parts = _external_cache_relative_parts(candidate, hermes_home=home)
+
+    if not _external_cache_dirfd_supported():
+        try:
+            home_metadata = home.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            home_metadata = None
+        if home_metadata is not None and (
+            path_entry_is_redirect(home, metadata=home_metadata)
+            or not stat.S_ISDIR(home_metadata.st_mode)
+        ):
+            raise OSError(f"HERMES_HOME is unsafe for scanner state: {home}")
+        _assert_external_cache_ancestry(
+            candidate,
+            allow_missing=create,
+            hermes_home=home,
+        )
+        raise OSError(
+            "race-safe descriptor-relative scanner cache access is unavailable"
+        )
+
+    if not home.is_absolute():
+        raise OSError(f"HERMES_HOME must be absolute for scanner state: {home}")
+    descriptor = _open_external_directory_at(home.anchor)
+    try:
+        for component in home.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            next_descriptor = _open_external_directory_at(
+                component,
+                parent_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        for component in ("cache", *cache_parts):
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            next_descriptor = _open_external_directory_at(
+                component,
+                parent_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_external_cache_regular_file(path: Path, max_bytes: int) -> bytes:
+    parent_fd = -1
+    file_fd = -1
+    path = _normalized_local_path(path)
+    try:
+        parent_fd = _open_external_cache_directory(path.parent)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        file_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"external scanner state is not a regular file: {path}")
+        if opened.st_size > max_bytes:
+            raise OSError(f"bounded file exceeds {max_bytes} bytes: {path}")
+        chunks: List[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            try:
+                chunk = os.read(file_fd, min(64 * 1024, remaining))
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > max_bytes:
+            raise OSError(f"bounded file exceeds {max_bytes} bytes: {path}")
+        return data
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _external_cache_lstat(path: Path):
+    path = _normalized_local_path(path)
+    parent_fd = _open_external_cache_directory(path.parent)
+    try:
+        return os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    finally:
+        os.close(parent_fd)
+
+
+def _unlink_external_cache_file(path: Path, *, missing_ok: bool = False) -> None:
+    path = _normalized_local_path(path)
+    try:
+        parent_fd = _open_external_cache_directory(path.parent)
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    try:
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        if path_entry_is_redirect(path, metadata=metadata) or not stat.S_ISREG(
+            metadata.st_mode
+        ):
+            raise OSError(f"external scanner state path is unsafe: {path}")
+        os.unlink(path.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_external_cache_tree(path: Path, *, hermes_home: Optional[Path] = None) -> None:
+    """Remove one private cache tree without following any redirect entry."""
+    path = _normalized_local_path(path)
+    cache_root = _external_cache_root(hermes_home=hermes_home)
+    if path == cache_root:
+        raise OSError("refusing to remove the external scanner cache root")
+    parent_fd = _open_external_cache_directory(
+        path.parent,
+        hermes_home=hermes_home,
+    )
+    try:
+        entries_seen = [0]
+
+        def _remove_at(directory_fd: int, name: str, hint: Path) -> None:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if path_entry_is_redirect(hint, metadata=metadata) or not stat.S_ISDIR(
+                metadata.st_mode
+            ):
+                raise OSError(f"external scanner cleanup target is unsafe: {hint}")
+            child_fd = _open_external_directory_at(name, parent_fd=directory_fd)
+            try:
+                with os.scandir(child_fd) as entries:
+                    for entry in entries:
+                        entries_seen[0] += 1
+                        if entries_seen[0] > _MAX_EXTERNAL_SCAN_ENTRIES:
+                            raise OSError(
+                                "external scanner cleanup exceeded its entry limit"
+                            )
+                        child_metadata = entry.stat(follow_symlinks=False)
+                        child_hint = hint / entry.name
+                        if stat.S_ISDIR(
+                            child_metadata.st_mode
+                        ) and not path_entry_is_redirect(
+                            child_hint,
+                            metadata=child_metadata,
+                        ):
+                            _remove_at(child_fd, entry.name, child_hint)
+                        else:
+                            os.unlink(entry.name, dir_fd=child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+
+        _remove_at(parent_fd, path.name, path)
+    finally:
+        os.close(parent_fd)
+
+
+def _rmdir_external_cache_directory_if_empty(path: Path) -> None:
+    path = _normalized_local_path(path)
+    parent_fd = _open_external_cache_directory(path.parent)
+    try:
+        metadata = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if path_entry_is_redirect(path, metadata=metadata) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            raise OSError(f"external scanner directory is unsafe: {path}")
+        os.rmdir(path.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _create_external_cache_directory_exact(path: Path) -> None:
+    """Create exactly one cache directory beneath a securely opened parent."""
+    path = _normalized_local_path(path)
+    parent_fd = _open_external_cache_directory(path.parent, create=True)
+    child_fd = -1
+    try:
+        os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
+        child_fd = _open_external_directory_at(path.name, parent_fd=parent_fd)
+        try:
+            os.fchmod(child_fd, 0o700)
+        except (AttributeError, OSError):
+            pass
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+        os.close(parent_fd)
+
+
 def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        encoded = _read_bounded_regular_file(
-            path,
-            EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
-        )
+        if _is_external_cache_path(path):
+            encoded = _read_external_cache_regular_file(
+                path,
+                EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
+            )
+        else:
+            encoded = _read_bounded_regular_file(
+                path,
+                EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
+            )
         parsed = json.loads(encoded.decode("utf-8"))
     except (OSError, UnicodeError, ValueError, TypeError):
         return None
@@ -283,15 +599,83 @@ def _write_json_object_atomic(path: Path, payload: Dict[str, Any]) -> None:
             f"({EXTERNAL_SKILLS_MAX_CATALOG_BYTES})"
         )
 
+    if _is_external_cache_path(path):
+        parent_fd = _open_external_cache_directory(path.parent, create=True)
+        temporary_name = f".{path.stem}-{secrets.token_hex(8)}.tmp"
+        file_descriptor = -1
+        try:
+            try:
+                existing = os.stat(
+                    path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and (
+                path_entry_is_redirect(path, metadata=existing)
+                or not stat.S_ISREG(existing.st_mode)
+            ):
+                raise OSError(f"external scanner state path is unsafe: {path}")
+
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            file_descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            with os.fdopen(file_descriptor, "wb") as handle:
+                file_descriptor = -1
+                if hasattr(os, "fchmod"):
+                    os.fchmod(handle.fileno(), 0o600)
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary_name = ""
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+        finally:
+            if file_descriptor >= 0:
+                os.close(file_descriptor)
+            if temporary_name:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            os.close(parent_fd)
+        return
+
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink() or not path.parent.is_dir():
+    parent_metadata = path.parent.stat(follow_symlinks=False)
+    if (
+        path_entry_is_redirect(path.parent, metadata=parent_metadata)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+    ):
         raise OSError(f"external scanner state parent is unsafe: {path.parent}")
     try:
         existing = path.stat(follow_symlinks=False)
     except FileNotFoundError:
         existing = None
-    if existing is not None and not stat.S_ISREG(existing.st_mode):
-        raise OSError(f"external scanner state path is unsafe: {path}")
+    if existing is not None:
+        if path_entry_is_redirect(path, metadata=existing) or not stat.S_ISREG(
+            existing.st_mode
+        ):
+            raise OSError(f"external scanner state path is unsafe: {path}")
 
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=str(path.parent),
@@ -434,7 +818,7 @@ def _current_external_snapshot_generation() -> Optional[Path]:
 
 def _external_catalog_pointer_exists() -> bool:
     try:
-        _external_catalog_cache_path().stat(follow_symlinks=False)
+        _external_cache_lstat(_external_catalog_cache_path())
     except FileNotFoundError:
         return False
     except OSError:
@@ -478,11 +862,11 @@ def _publish_external_materialized_generation(
             "race-safe descriptor-relative snapshot publication is unavailable"
         )
     base = _external_materialized_snapshot_dir()
-    base.mkdir(parents=True, exist_ok=True, mode=0o700)
     base_fd = -1
     fingerprint_fd = -1
+    staging_parent_fd = -1
     try:
-        base_fd = _open_external_directory_at(base)
+        base_fd = _open_external_cache_directory(base, create=True)
         try:
             os.mkdir(fingerprint, mode=0o700, dir_fd=base_fd)
         except FileExistsError:
@@ -496,9 +880,21 @@ def _publish_external_materialized_generation(
             os.fchmod(fingerprint_fd, 0o700)
         except (AttributeError, OSError):
             pass
+        staging = _normalized_local_path(staging)
+        staging_parent_fd = _open_external_cache_directory(staging.parent)
+        staging_metadata = os.stat(
+            staging.name,
+            dir_fd=staging_parent_fd,
+            follow_symlinks=False,
+        )
+        if path_entry_is_redirect(staging, metadata=staging_metadata) or not stat.S_ISDIR(
+            staging_metadata.st_mode
+        ):
+            raise OSError(f"external scan staging path is unsafe: {staging}")
         os.rename(
-            staging,
+            staging.name,
             scan_id,
+            src_dir_fd=staging_parent_fd,
             dst_dir_fd=fingerprint_fd,
         )
         try:
@@ -507,6 +903,8 @@ def _publish_external_materialized_generation(
         except OSError:
             pass
     finally:
+        if staging_parent_fd >= 0:
+            os.close(staging_parent_fd)
         if fingerprint_fd >= 0:
             os.close(fingerprint_fd)
         if base_fd >= 0:
@@ -557,7 +955,7 @@ def _external_snapshot_generation_metadata(
         # whether another materialization is safe to admit.
         materialized_bytes = _MAX_EXTERNAL_MATERIALIZED_TOTAL_BYTES
         try:
-            created_at_ns = generation.stat(follow_symlinks=False).st_mtime_ns
+            created_at_ns = _external_cache_lstat(generation).st_mtime_ns
         except OSError:
             created_at_ns = 0
     return _ExternalSnapshotGeneration(
@@ -572,48 +970,73 @@ def _external_snapshot_generation_metadata(
 def _list_external_snapshot_generations() -> List[_ExternalSnapshotGeneration]:
     """List at most a bounded number of local two-level generations."""
     base = _external_materialized_snapshot_dir()
+    base_fd = -1
     try:
-        metadata = base.stat(follow_symlinks=False)
+        base_fd = _open_external_cache_directory(base)
     except FileNotFoundError:
         return []
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise OSError(f"external snapshot root is unsafe: {base}")
+    if not _external_cache_dirfd_supported():
+        os.close(base_fd)
+        raise OSError(
+            "race-safe descriptor-relative snapshot indexing is unavailable"
+        )
 
     generations: List[_ExternalSnapshotGeneration] = []
     entries_seen = 0
-    with os.scandir(base) as fingerprints:
-        for fingerprint_entry in fingerprints:
-            entries_seen += 1
-            if entries_seen > _MAX_EXTERNAL_SNAPSHOT_INDEX_ENTRIES:
-                raise OSError("external snapshot index exceeded its entry limit")
-            if fingerprint_entry.is_symlink():
-                raise OSError("external snapshot index contains a symlink")
-            if not fingerprint_entry.is_dir(follow_symlinks=False):
-                continue
-            fingerprint_dir = base / fingerprint_entry.name
-            with os.scandir(fingerprint_dir) as candidates:
-                for candidate_entry in candidates:
-                    entries_seen += 1
-                    if entries_seen > _MAX_EXTERNAL_SNAPSHOT_INDEX_ENTRIES:
-                        raise OSError(
-                            "external snapshot index exceeded its entry limit"
-                        )
-                    if candidate_entry.is_symlink():
-                        raise OSError(
-                            "external snapshot generation index contains a symlink"
-                        )
-                    if not candidate_entry.is_dir(follow_symlinks=False):
-                        continue
-                    candidate = fingerprint_dir / candidate_entry.name
-                    generations.append(
-                        _external_snapshot_generation_metadata(
-                            candidate,
-                            quarantined=candidate_entry.name.startswith(
-                                _EXTERNAL_SNAPSHOT_GC_PREFIX
-                            ),
-                        )
-                    )
-    return generations
+    try:
+        with os.scandir(base_fd) as fingerprints:
+            for fingerprint_entry in fingerprints:
+                entries_seen += 1
+                if entries_seen > _MAX_EXTERNAL_SNAPSHOT_INDEX_ENTRIES:
+                    raise OSError("external snapshot index exceeded its entry limit")
+                fingerprint_metadata = fingerprint_entry.stat(follow_symlinks=False)
+                fingerprint_path = base / fingerprint_entry.name
+                if path_entry_is_redirect(
+                    fingerprint_path,
+                    metadata=fingerprint_metadata,
+                ):
+                    raise OSError("external snapshot index contains a redirect")
+                if not stat.S_ISDIR(fingerprint_metadata.st_mode):
+                    continue
+                fingerprint_fd = _open_external_directory_at(
+                    fingerprint_entry.name,
+                    parent_fd=base_fd,
+                )
+                try:
+                    with os.scandir(fingerprint_fd) as candidates:
+                        for candidate_entry in candidates:
+                            entries_seen += 1
+                            if entries_seen > _MAX_EXTERNAL_SNAPSHOT_INDEX_ENTRIES:
+                                raise OSError(
+                                    "external snapshot index exceeded its entry limit"
+                                )
+                            candidate_metadata = candidate_entry.stat(
+                                follow_symlinks=False
+                            )
+                            candidate = fingerprint_path / candidate_entry.name
+                            if path_entry_is_redirect(
+                                candidate,
+                                metadata=candidate_metadata,
+                            ):
+                                raise OSError(
+                                    "external snapshot generation index contains a redirect"
+                                )
+                            if not stat.S_ISDIR(candidate_metadata.st_mode):
+                                continue
+                            generations.append(
+                                _external_snapshot_generation_metadata(
+                                    candidate,
+                                    quarantined=candidate_entry.name.startswith(
+                                        _EXTERNAL_SNAPSHOT_GC_PREFIX
+                                    ),
+                                )
+                            )
+                finally:
+                    os.close(fingerprint_fd)
+        return generations
+    finally:
+        if base_fd >= 0:
+            os.close(base_fd)
 
 
 def _try_acquire_external_snapshot_gc_lock(generation: Path):
@@ -625,12 +1048,6 @@ def _try_acquire_external_snapshot_gc_lock(generation: Path):
         f".{generation.name}{EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX}"
     )
     try:
-        directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
         lease_flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -638,26 +1055,23 @@ def _try_acquire_external_snapshot_gc_lock(generation: Path):
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_NONBLOCK", 0)
         )
-        supports_dir_fd = os.open in getattr(os, "supports_dir_fd", ())
-        if supports_dir_fd:
-            parent_fd = os.open(generation.parent, directory_flags)
-            lease_fd = os.open(
-                lease_name,
-                lease_flags,
-                0o600,
-                dir_fd=parent_fd,
-            )
-        else:
-            if generation.is_symlink():
-                return None
-            lease_path = generation.parent / lease_name
-            try:
-                lease_stat = lease_path.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                lease_stat = None
-            if lease_stat is not None and stat.S_ISLNK(lease_stat.st_mode):
-                return None
-            lease_fd = os.open(lease_path, lease_flags, 0o600)
+        parent_fd = _open_external_cache_directory(generation.parent)
+        generation_metadata = os.stat(
+            generation.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if path_entry_is_redirect(
+            generation,
+            metadata=generation_metadata,
+        ) or not stat.S_ISDIR(generation_metadata.st_mode):
+            return None
+        lease_fd = os.open(
+            lease_name,
+            lease_flags,
+            0o600,
+            dir_fd=parent_fd,
+        )
         if not stat.S_ISREG(os.fstat(lease_fd).st_mode):
             return None
         handle = os.fdopen(lease_fd, "a+b")
@@ -735,7 +1149,7 @@ def _remove_external_snapshot_generation(
                 f"{_EXTERNAL_SNAPSHOT_GC_PREFIX}{generation.path.name}-"
                 f"{secrets.token_hex(4)}"
             )
-            parent_fd = _open_external_directory_at(generation.path.parent)
+            parent_fd = _open_external_cache_directory(generation.path.parent)
             os.rename(
                 generation.path.name,
                 quarantine.name,
@@ -751,7 +1165,7 @@ def _remove_external_snapshot_generation(
 
     if quarantine != generation.path:
         try:
-            original_lease_path.unlink(missing_ok=True)
+            _unlink_external_cache_file(original_lease_path, missing_ok=True)
         except OSError:
             logger.debug(
                 "Could not remove retired external snapshot lease file %s",
@@ -760,7 +1174,7 @@ def _remove_external_snapshot_generation(
             )
 
     try:
-        shutil.rmtree(quarantine)
+        _remove_external_cache_tree(quarantine)
     except FileNotFoundError:
         return True
     except OSError:
@@ -774,7 +1188,7 @@ def _remove_external_snapshot_generation(
         f".{generation.path.name}{EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX}"
     )
     try:
-        lease_path.unlink(missing_ok=True)
+        _unlink_external_cache_file(lease_path, missing_ok=True)
     except OSError:
         logger.debug(
             "Could not remove retired external snapshot lease file %s",
@@ -782,7 +1196,7 @@ def _remove_external_snapshot_generation(
             exc_info=True,
         )
     try:
-        generation.path.parent.rmdir()
+        _rmdir_external_cache_directory_if_empty(generation.path.parent)
     except OSError:
         pass
     return True
@@ -872,7 +1286,7 @@ def _confirm_empty_external_catalog_transition(
         and pending.get("scan_id") != scan_id
     ):
         try:
-            path.unlink(missing_ok=True)
+            _unlink_external_cache_file(path, missing_ok=True)
         except OSError:
             logger.debug("Could not clear external empty confirmation", exc_info=True)
         return True
@@ -891,7 +1305,10 @@ def _confirm_empty_external_catalog_transition(
 
 def _clear_external_empty_confirmation() -> None:
     try:
-        _external_empty_confirmation_path().unlink(missing_ok=True)
+        _unlink_external_cache_file(
+            _external_empty_confirmation_path(),
+            missing_ok=True,
+        )
     except OSError:
         logger.debug("Could not clear external empty confirmation", exc_info=True)
 
@@ -940,7 +1357,7 @@ def _record_external_scan_failure(fingerprint: str, reason: str) -> float:
 
 def _clear_external_scan_backoff() -> None:
     try:
-        _external_scan_backoff_path().unlink(missing_ok=True)
+        _unlink_external_cache_file(_external_scan_backoff_path(), missing_ok=True)
     except OSError:
         logger.debug("Could not clear external skill scan backoff", exc_info=True)
 
@@ -982,12 +1399,18 @@ def _safe_cleanup_external_scan_work_dir(
     raw_path: str,
     raw_cache_dir: Optional[str] = None,
 ) -> None:
-    path = Path(raw_path)
-    cache_dir = Path(raw_cache_dir) if raw_cache_dir else _hermes_home() / "cache"
+    path = _normalized_local_path(Path(raw_path))
+    cache_dir = _normalized_local_path(
+        Path(raw_cache_dir) if raw_cache_dir else _hermes_home() / "cache"
+    )
     if path.parent != cache_dir or not path.name.startswith(".external-scan-"):
         return
     try:
-        shutil.rmtree(path)
+        _assert_external_cache_ancestry(
+            path,
+            hermes_home=cache_dir.parent,
+        )
+        _remove_external_cache_tree(path, hermes_home=cache_dir.parent)
     except FileNotFoundError:
         pass
     except OSError:
@@ -1054,8 +1477,12 @@ def _active_external_scan_orphan() -> str:
         _EXTERNAL_SCAN_ORPHAN_PIDS.discard(pid)
 
     path = _external_scan_orphan_path()
-    if not path.exists():
+    try:
+        _external_cache_lstat(path)
+    except FileNotFoundError:
         return ""
+    except OSError:
+        return "external skill scan orphan lease ancestry is unsafe"
     payload = _read_json_object(path)
     if not payload:
         return "external skill scan orphan lease is invalid"
@@ -1070,7 +1497,7 @@ def _active_external_scan_orphan() -> str:
     if isinstance(work_dir, str):
         _schedule_external_scan_work_dir_cleanup(work_dir)
     try:
-        path.unlink(missing_ok=True)
+        _unlink_external_cache_file(path, missing_ok=True)
     except OSError:
         return "external skill scan orphan lease could not be cleared"
     return ""
@@ -1081,16 +1508,21 @@ def _try_acquire_external_scan_file_lock():
     path = _external_scan_lock_path()
     handle = None
     descriptor = -1
+    parent_descriptor = -1
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            path,
+        parent_descriptor = _open_external_cache_directory(path.parent, create=True)
+        flags = (
             os.O_RDWR
             | os.O_CREAT
             | getattr(os, "O_BINARY", 0)
             | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0),
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(
+            path.name,
+            flags,
             0o600,
+            dir_fd=parent_descriptor,
         )
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -1124,6 +1556,9 @@ def _try_acquire_external_scan_file_lock():
         except (AttributeError, OSError):
             pass
         return None
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
 
 
 def _release_external_scan_file_lock(handle) -> None:
@@ -1171,6 +1606,7 @@ def _external_fd_traversal_supported() -> bool:
     """Whether this runtime can walk directories from already-open handles."""
     return (
         os.name != "nt"
+        and bool(getattr(os, "O_NOFOLLOW", 0))
         and os.open in getattr(os, "supports_dir_fd", ())
         and os.scandir in getattr(os, "supports_fd", ())
     )
@@ -1343,52 +1779,76 @@ def _copy_external_snapshot_file_at(
         source_directory_fd,
         source_name,
     )
-    if source_stat.st_size > _MAX_EXTERNAL_MATERIALIZED_FILE_BYTES:
-        os.close(source_fd)
-        raise OSError(
-            "external skill snapshot exceeded the per-file byte safety limit "
-            f"({_MAX_EXTERNAL_MATERIALIZED_FILE_BYTES})"
-        )
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination_parent_fd = -1
+    destination_fd = -1
     copied = 0
     try:
-        with os.fdopen(source_fd, "rb", closefd=True) as source_handle, destination.open(
-            "xb"
-        ) as destination_handle:
-            source_fd = -1
-            while True:
-                chunk = source_handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                copied += len(chunk)
-                if copied > _MAX_EXTERNAL_MATERIALIZED_FILE_BYTES:
-                    raise OSError(
-                        "external skill snapshot exceeded the per-file byte safety limit "
-                        f"({_MAX_EXTERNAL_MATERIALIZED_FILE_BYTES})"
-                    )
-                if budget["bytes"] + len(chunk) > _MAX_EXTERNAL_MATERIALIZED_TOTAL_BYTES:
-                    raise OSError(
-                        "external skill snapshot exceeded the total byte safety limit "
-                        f"({_MAX_EXTERNAL_MATERIALIZED_TOTAL_BYTES})"
-                    )
-                destination_handle.write(chunk)
-                budget["bytes"] += len(chunk)
+        if source_stat.st_size > _MAX_EXTERNAL_MATERIALIZED_FILE_BYTES:
+            raise OSError(
+                "external skill snapshot exceeded the per-file byte safety limit "
+                f"({_MAX_EXTERNAL_MATERIALIZED_FILE_BYTES})"
+            )
+        destination_parent_fd = _open_external_cache_directory(
+            destination.parent,
+            create=True,
+        )
+        destination_fd = os.open(
+            destination.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=destination_parent_fd,
+        )
+        source_handle = os.fdopen(source_fd, "rb", closefd=True)
+        source_fd = -1
+        with source_handle:
+            destination_handle = os.fdopen(destination_fd, "wb", closefd=True)
+            destination_fd = -1
+            with destination_handle:
+                while True:
+                    chunk = source_handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > _MAX_EXTERNAL_MATERIALIZED_FILE_BYTES:
+                        raise OSError(
+                            "external skill snapshot exceeded the per-file byte safety limit "
+                            f"({_MAX_EXTERNAL_MATERIALIZED_FILE_BYTES})"
+                        )
+                    if budget["bytes"] + len(chunk) > _MAX_EXTERNAL_MATERIALIZED_TOTAL_BYTES:
+                        raise OSError(
+                            "external skill snapshot exceeded the total byte safety limit "
+                            f"({_MAX_EXTERNAL_MATERIALIZED_TOTAL_BYTES})"
+                        )
+                    destination_handle.write(chunk)
+                    budget["bytes"] += len(chunk)
 
-            final_stat = os.fstat(source_handle.fileno())
-            if (
-                final_stat.st_size != source_stat.st_size
-                or final_stat.st_mtime_ns != source_stat.st_mtime_ns
-            ):
-                raise OSError(
-                    f"external skill file changed while being materialized: {source_name}"
-                )
+                final_stat = os.fstat(source_handle.fileno())
+                if (
+                    final_stat.st_size != source_stat.st_size
+                    or final_stat.st_mtime_ns != source_stat.st_mtime_ns
+                ):
+                    raise OSError(
+                        "external skill file changed while being materialized: "
+                        f"{source_name}"
+                    )
+                try:
+                    os.fchmod(
+                        destination_handle.fileno(),
+                        stat.S_IMODE(source_stat.st_mode) & 0o700,
+                    )
+                except (AttributeError, OSError):
+                    pass
     finally:
         if source_fd >= 0:
             os.close(source_fd)
-    try:
-        destination.chmod(stat.S_IMODE(source_stat.st_mode) & 0o700)
-    except OSError:
-        pass
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if destination_parent_fd >= 0:
+            os.close(destination_parent_fd)
 
 
 def _materialize_external_skill_package_fd(
@@ -1405,7 +1865,8 @@ def _materialize_external_skill_package_fd(
             "external skill scan exceeded the depth safety limit "
             f"({_MAX_EXTERNAL_SCAN_DEPTH})"
         )
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination_fd = _open_external_cache_directory(destination, create=True)
+    os.close(destination_fd)
     entries = _bounded_external_directory_entries_fd(source_fd, budget)
     if require_skill_md and dict(entries).get("SKILL.md") != "file":
         raise OSError("external skill package changed before materialization")
@@ -1512,7 +1973,7 @@ def _scan_external_roots_fd(
         budget = _new_external_scan_budget()
 
     if materialized_root is not None:
-        materialized_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+        _create_external_cache_directory_exact(materialized_root)
 
     for root_index, root_text in enumerate(roots):
         root = Path(root_text)
@@ -1521,7 +1982,7 @@ def _scan_external_roots_fd(
         try:
             if materialized_root is not None:
                 destination_root = materialized_root / f"root-{root_index:04d}"
-                destination_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+                _create_external_cache_directory_exact(destination_root)
             _scan_external_directory_fd(
                 root_fd,
                 directory_name=root.name,
@@ -1587,16 +2048,36 @@ def _write_external_scan_result(path: Path, payload: Dict[str, Any]) -> None:
             "external skill scan result exceeded the total byte safety limit "
             f"({EXTERNAL_SKILLS_MAX_CATALOG_BYTES})"
         )
-    with path.open("xb") as handle:
-        handle.write(encoded)
+    path = _normalized_local_path(path)
+    parent_fd = _open_external_cache_directory(path.parent)
+    descriptor = -1
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(encoded)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
 
 
 def _external_scan_worker(
     result_path: str,
     roots: Tuple[str, ...],
     materialized_root: str,
+    hermes_home: str,
 ) -> None:
     """Child entrypoint: all external I/O, with a bounded local result file."""
+    global HERMES_HOME
+    HERMES_HOME = Path(hermes_home)
     path = Path(result_path)
     try:
         budget = _new_external_scan_budget()
@@ -1615,8 +2096,7 @@ def _external_scan_worker(
         )
     except Exception as exc:
         try:
-            if path.exists():
-                path.unlink()
+            _unlink_external_cache_file(path, missing_ok=True)
             _write_external_scan_result(
                 path,
                 {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:2000]},
@@ -1653,10 +2133,18 @@ def _terminate_external_scan_process(process, *, deadline: Optional[float] = Non
 
 def _read_external_scan_result(path: Path) -> Dict[str, Any]:
     try:
-        encoded = _read_bounded_regular_file(
-            path,
-            EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
-        )
+        if _is_external_cache_path(path):
+            encoded = _read_external_cache_regular_file(
+                path,
+                EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
+            )
+        else:
+            # Kept for direct unit callers. Production result paths are always
+            # created under the verified private scan work directory above.
+            encoded = _read_bounded_regular_file(
+                path,
+                EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
+            )
     except OSError as exc:
         if "exceeds" in str(exc):
             raise RuntimeError(
@@ -1692,6 +2180,23 @@ def _read_external_scan_result(path: Path) -> Dict[str, Any]:
     return payload
 
 
+def _create_external_scan_work_dir(cache_dir: Path) -> Path:
+    """Reserve one private work directory beneath the verified cache root."""
+    cache_dir = _normalized_local_path(cache_dir)
+    cache_fd = _open_external_cache_directory(cache_dir, create=True)
+    try:
+        for _attempt in range(64):
+            name = f".external-scan-{secrets.token_hex(8)}"
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=cache_fd)
+            except FileExistsError:
+                continue
+            return cache_dir / name
+        raise OSError("could not reserve a unique external scan work directory")
+    finally:
+        os.close(cache_fd)
+
+
 def _run_external_scan_subprocess(
     roots: Tuple[str, ...], timeout_seconds: float
 ) -> ExternalScanResult:
@@ -1702,15 +2207,19 @@ def _run_external_scan_subprocess(
     )
     deadline = time.monotonic() + timeout_seconds
     cache_dir = _hermes_home() / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(tempfile.mkdtemp(prefix=".external-scan-", dir=cache_dir))
+    work_dir = _create_external_scan_work_dir(cache_dir)
     result_path = work_dir / "result.json"
     materialized_staging = work_dir / "materialized"
     scan_id = f"{time.time_ns()}-{secrets.token_hex(8)}"
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_external_scan_worker,
-        args=(str(result_path), roots, str(materialized_staging)),
+        args=(
+            str(result_path),
+            roots,
+            str(materialized_staging),
+            str(_hermes_home()),
+        ),
         daemon=True,
         name="hermes-external-skill-scan",
     )
@@ -2092,7 +2601,7 @@ def _read_suppressed_names() -> set:
         return names
 
 
-def _write_manifest(entries: Dict[str, str]):
+def _write_manifest(entries: Dict[str, str]) -> bool:
     """Write the manifest file atomically in v2 format (name:hash).
 
     Uses the shared atomic writer so an existing manifest's permission
@@ -2110,8 +2619,10 @@ def _write_manifest(entries: Dict[str, str]):
             tmp_prefix=".bundled_manifest_",
             preserve_mode=True,
         )
+        return True
     except Exception as e:
         logger.debug("Failed to write skills manifest %s: %s", _manifest_file(), e, exc_info=True)
+        return False
 
 
 def _read_skill_name(
@@ -2602,6 +3113,313 @@ def _recover_renamed_skill(
     return None
 
 
+def _bundled_sync_staging_root(dest: Path) -> Path:
+    """Return the hidden, discovery-excluded staging root beside *dest*."""
+    return dest.parent / _BUNDLED_SYNC_STAGING_DIR
+
+
+def _bundled_promotion_receipt_path(dest: Path) -> Path:
+    """Return the private receipt paired with ``dest.with_suffix('.bak')``."""
+    return dest.parent / f".{dest.name}.bak-promotion.json"
+
+
+def _bundled_destination_identity(dest: Path) -> str:
+    try:
+        return dest.relative_to(_skills_dir()).as_posix()
+    except ValueError as exc:
+        raise OSError(f"bundled skill destination escapes skills root: {dest}") from exc
+
+
+def _valid_bundled_hash(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _write_bundled_promotion_receipt(
+    dest: Path,
+    *,
+    origin_hash: str,
+    promoted_hash: str,
+) -> Path:
+    """Durably record the exact content expected after atomic promotion."""
+    if not _valid_bundled_hash(origin_hash) or not _valid_bundled_hash(
+        promoted_hash
+    ):
+        raise OSError("bundled promotion receipt contains an invalid hash")
+    if path_has_redirected_component(dest.parent, root=_skills_dir()):
+        raise OSError(f"bundled skill destination parent is unsafe: {dest.parent}")
+    receipt = _bundled_promotion_receipt_path(dest)
+    _write_json_object_atomic(
+        receipt,
+        {
+            "version": _BUNDLED_PROMOTION_RECEIPT_VERSION,
+            "destination": _bundled_destination_identity(dest),
+            "origin_hash": origin_hash,
+            "promoted_hash": promoted_hash,
+        },
+    )
+    return receipt
+
+
+def _read_bundled_promotion_receipt(dest: Path) -> Optional[Dict[str, Any]]:
+    """Read one bounded, no-follow receipt or return ``None`` if invalid."""
+    receipt = _bundled_promotion_receipt_path(dest)
+    try:
+        if path_has_redirected_component(dest.parent, root=_skills_dir()):
+            return None
+        payload = json.loads(
+            _read_bounded_regular_file(
+                receipt,
+                _MAX_BUNDLED_PROMOTION_RECEIPT_BYTES,
+            ).decode("utf-8")
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != _BUNDLED_PROMOTION_RECEIPT_VERSION
+            or payload.get("destination") != _bundled_destination_identity(dest)
+            or not _valid_bundled_hash(payload.get("origin_hash"))
+            or not _valid_bundled_hash(payload.get("promoted_hash"))
+        ):
+            return None
+        return payload
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def _discard_bundled_promotion_receipt(dest: Path) -> None:
+    receipt = _bundled_promotion_receipt_path(dest)
+    try:
+        metadata = receipt.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if path_entry_is_redirect(receipt, metadata=metadata) or not stat.S_ISREG(
+        metadata.st_mode
+    ):
+        raise OSError(f"bundled promotion receipt is unsafe: {receipt}")
+    receipt.unlink()
+
+
+def _retire_bundled_update_backup(dest: Path, backup: Path) -> None:
+    """Retire a committed backup and its receipt without orphaning trust."""
+    # Removing the receipt first is crash-safe: once the manifest is committed,
+    # a leftover backup can be recognized and retired without the receipt.
+    _discard_bundled_promotion_receipt(dest)
+    if backup.exists():
+        _rmtree_writable(backup)
+
+
+def _cleanup_stale_bundled_sync_staging(
+    staging_root: Path,
+    *,
+    now: Optional[float] = None,
+) -> int:
+    """Remove a bounded set of old, owned private-copy directories.
+
+    A SIGKILL during ``copytree`` cannot run the normal ``finally`` cleanup.
+    Inspect only direct children of the known local staging root, never follow
+    symlinks, and leave fresh entries alone because another sync may own them.
+    """
+    try:
+        if path_has_redirected_component(
+            staging_root.parent,
+            root=_skills_dir(),
+            allow_missing=True,
+        ):
+            logger.warning(
+                "Refusing redirected bundled skill staging parent %s",
+                staging_root.parent,
+            )
+            return 0
+    except OSError:
+        logger.warning("Could not validate bundled skill staging parent %s", staging_root)
+        return 0
+    try:
+        metadata = staging_root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        logger.warning("Could not inspect bundled skill staging root %s", staging_root)
+        return 0
+    try:
+        staging_is_redirect = path_entry_is_redirect(
+            staging_root,
+            metadata=metadata,
+        )
+    except OSError:
+        staging_is_redirect = True
+    if not stat.S_ISDIR(metadata.st_mode) or staging_is_redirect:
+        logger.warning("Refusing unsafe bundled skill staging root %s", staging_root)
+        return 0
+
+    cutoff = (time.time() if now is None else now) - _BUNDLED_SYNC_STAGING_STALE_SECONDS
+    removed = 0
+    inspected = 0
+    try:
+        with os.scandir(staging_root) as entries:
+            for entry in entries:
+                if inspected >= _MAX_BUNDLED_SYNC_STAGING_CLEANUP_ENTRIES:
+                    break
+                inspected += 1
+                # Only mkdtemp names created by _stage_bundled_skill_copy are
+                # ours. Unknown entries remain untouched for operator review.
+                prefix, marker, suffix = entry.name.partition(".tmp-")
+                if not marker or not prefix or not suffix:
+                    continue
+                try:
+                    entry_metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                entry_path = Path(entry.path)
+                try:
+                    entry_is_redirect = path_entry_is_redirect(
+                        entry_path,
+                        metadata=entry_metadata,
+                    )
+                except OSError:
+                    entry_is_redirect = True
+                if (
+                    not stat.S_ISDIR(entry_metadata.st_mode)
+                    or entry_is_redirect
+                    or entry_metadata.st_mtime > cutoff
+                ):
+                    continue
+                try:
+                    _rmtree_writable(entry_path)
+                    removed += 1
+                except (OSError, ValueError):
+                    logger.warning(
+                        "Could not remove stale bundled skill staging path %s",
+                        entry.path,
+                        exc_info=True,
+                    )
+    except OSError:
+        logger.warning("Could not enumerate bundled skill staging root %s", staging_root)
+        return removed
+
+    try:
+        staging_root.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
+def _discard_staged_bundled_skill(staged: Optional[Path]) -> None:
+    """Best-effort cleanup for an unpromoted private bundled-skill copy."""
+    if staged is None:
+        return
+    try:
+        if path_has_redirected_component(staged.parent, root=_skills_dir()):
+            raise OSError(f"bundled skill staging parent is unsafe: {staged.parent}")
+        if os.path.lexists(staged):
+            metadata = staged.stat(follow_symlinks=False)
+            if path_entry_is_redirect(
+                staged,
+                metadata=metadata,
+            ) or not stat.S_ISDIR(metadata.st_mode):
+                raise OSError(f"bundled skill staging path is unsafe: {staged}")
+            _rmtree_writable(staged)
+    except OSError:
+        logger.warning("Could not clean bundled skill staging path %s", staged)
+        return
+    try:
+        staged.parent.rmdir()
+    except OSError:
+        # Another concurrent sync may own a sibling staging directory.
+        pass
+
+
+def _stage_bundled_skill_copy(skill_src: Path, dest: Path) -> Path:
+    """Copy one bundled skill privately without exposing partial content."""
+    staging_root = _bundled_sync_staging_root(dest)
+    if path_has_redirected_component(
+        staging_root.parent,
+        root=_skills_dir(),
+        allow_missing=True,
+    ):
+        raise OSError(f"bundled skill staging parent is unsafe: {staging_root.parent}")
+    staging_root.parent.mkdir(parents=True, exist_ok=True)
+    if path_has_redirected_component(staging_root.parent, root=_skills_dir()):
+        raise OSError(f"bundled skill staging parent is unsafe: {staging_root.parent}")
+    try:
+        os.mkdir(staging_root, 0o700)
+    except FileExistsError:
+        pass
+    metadata = staging_root.stat(follow_symlinks=False)
+    if path_entry_is_redirect(
+        staging_root,
+        metadata=metadata,
+    ) or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"bundled skill staging root is unsafe: {staging_root}")
+    staged = Path(
+        tempfile.mkdtemp(prefix=f"{dest.name}.tmp-", dir=str(staging_root))
+    )
+    try:
+        staged_metadata = staged.stat(follow_symlinks=False)
+        if path_entry_is_redirect(
+            staged,
+            metadata=staged_metadata,
+        ) or not stat.S_ISDIR(staged_metadata.st_mode):
+            raise OSError(f"bundled skill staging path is unsafe: {staged}")
+        # mkdtemp reserves an unguessable private path. dirs_exist_ok lets
+        # copytree populate that already-created directory and still applies
+        # the source directory metadata at the end.
+        shutil.copytree(skill_src, staged, dirs_exist_ok=True)
+        return staged
+    except BaseException:
+        _discard_staged_bundled_skill(staged)
+        raise
+
+
+def _promote_staged_bundled_skill(staged: Path, dest: Path) -> None:
+    """Atomically publish a complete staged skill into an absent destination."""
+    expected_root = _bundled_sync_staging_root(dest)
+    if staged.parent != expected_root:
+        raise OSError(f"bundled skill staging path has the wrong owner: {staged}")
+    if path_has_redirected_component(expected_root, root=_skills_dir()):
+        raise OSError(f"bundled skill staging path is unsafe: {staged}")
+    root_metadata = expected_root.stat(follow_symlinks=False)
+    staged_metadata = staged.stat(follow_symlinks=False)
+    if (
+        path_entry_is_redirect(expected_root, metadata=root_metadata)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or path_entry_is_redirect(staged, metadata=staged_metadata)
+        or not stat.S_ISDIR(staged_metadata.st_mode)
+    ):
+        raise OSError(f"bundled skill staging path is unsafe: {staged}")
+    if os.path.lexists(dest):
+        raise FileExistsError(f"bundled skill destination already exists: {dest}")
+    os.rename(staged, dest)
+    if os.name != "nt":
+        try:
+            parent_fd = os.open(
+                dest.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            pass
+    try:
+        expected_root.rmdir()
+    except OSError:
+        pass
+
+
+def _install_bundled_skill_atomic(skill_src: Path, dest: Path) -> None:
+    """Stage then atomically install a new bundled skill directory."""
+    staged = _stage_bundled_skill_copy(skill_src, dest)
+    try:
+        _promote_staged_bundled_skill(staged, dest)
+        staged = None
+    finally:
+        _discard_staged_bundled_skill(staged)
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
@@ -2670,6 +3488,15 @@ def sync_skills(quiet: bool = False) -> dict:
         raise ExternalSkillIndexUnavailable(reason)
 
     _skills_dir().mkdir(parents=True, exist_ok=True)
+    # A prior process may have died while privately copying a bundled skill.
+    # Sweep only the finite set of category-local roots implied by the current
+    # bundle, and bound direct-child inspection within each root.
+    staging_roots = {
+        _bundled_sync_staging_root(_compute_relative_dest(src, bundled_dir))
+        for _name, src in bundled_skills
+    }
+    for staging_root in staging_roots:
+        _cleanup_stale_bundled_sync_staging(staging_root)
     manifest = _read_manifest()
     suppressed = _read_suppressed_names()
     shadowed_by_external: List[str] = []
@@ -2683,6 +3510,7 @@ def sync_skills(quiet: bool = False) -> dict:
     user_modified = []
     suppressed_skipped: List[str] = []
     relocated: List[str] = []
+    committed_backups: List[Tuple[Path, Path]] = []
     skipped = 0
 
     for skill_name, skill_src in bundled_skills:
@@ -2729,8 +3557,8 @@ def sync_skills(quiet: bool = False) -> dict:
         _orphan = dest.with_suffix(".bak")
         if _orphan.exists() and not dest.exists():
             try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(_orphan), str(dest))
+                _discard_bundled_promotion_receipt(dest)
                 logger.info("Recovered orphaned skill backup: %s", _orphan)
             except (OSError, IOError):
                 logger.warning(
@@ -2782,8 +3610,7 @@ def sync_skills(quiet: bool = False) -> dict:
                             f"to replace it with the bundled version."
                         )
                 else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(skill_src, dest)
+                    _install_bundled_skill_atomic(skill_src, dest)
                     copied.append(skill_name)
                     manifest[skill_name] = bundled_hash
                     if not quiet:
@@ -2803,10 +3630,67 @@ def sync_skills(quiet: bool = False) -> dict:
             # bundled source changes, the normal user-modification check below
             # still protects local edits before any overwrite.
             if origin_hash and bundled_hash == origin_hash:
+                # The manifest is the commit record. A backup left behind by
+                # process exit after that atomic write is now safe to retire.
+                committed_backup = dest.with_suffix(".bak")
+                if committed_backup.exists():
+                    try:
+                        _retire_bundled_update_backup(dest, committed_backup)
+                    except (OSError, IOError):
+                        logger.debug(
+                            "Could not remove committed backup %s",
+                            committed_backup,
+                            exc_info=True,
+                        )
                 skipped += 1
                 continue
 
             user_hash = _dir_hash(dest)
+
+            # Recover a completed atomic promotion whose process exited before
+            # the manifest reached disk.  The receipt records the promoted
+            # content hash independently of whatever version is bundled now,
+            # so a later v3 source cannot make a complete v2 promotion look
+            # user-modified.  Validate the original backup too, then commit
+            # the recovered v2 baseline before attempting another update.
+            backup = dest.with_suffix(".bak")
+            promotion_receipt = (
+                _read_bundled_promotion_receipt(dest)
+                if origin_hash and backup.exists()
+                else None
+            )
+            receipt_matches = False
+            if promotion_receipt is not None:
+                try:
+                    backup_metadata = backup.stat(follow_symlinks=False)
+                    receipt_matches = bool(
+                        not path_entry_is_redirect(
+                            backup,
+                            metadata=backup_metadata,
+                        )
+                        and stat.S_ISDIR(backup_metadata.st_mode)
+                        and promotion_receipt.get("origin_hash") == origin_hash
+                        and promotion_receipt.get("promoted_hash") == user_hash
+                        and _dir_hash(backup) == origin_hash
+                    )
+                except OSError:
+                    receipt_matches = False
+            recovered_hash = (
+                str(promotion_receipt["promoted_hash"])
+                if receipt_matches and promotion_receipt is not None
+                else None
+            )
+            legacy_recovery = bool(
+                origin_hash
+                and backup.exists()
+                and promotion_receipt is None
+                and user_hash == bundled_hash
+            )
+            if recovered_hash is not None or legacy_recovery:
+                manifest[skill_name] = recovered_hash or bundled_hash
+                updated.append(skill_name)
+                committed_backups.append((dest, backup))
+                continue
 
             if not origin_hash:
                 # v1 migration: no origin hash recorded. Set baseline from
@@ -2829,42 +3713,51 @@ def sync_skills(quiet: bool = False) -> dict:
             # User copy matches origin — check if bundled has a newer version
             if bundled_hash != origin_hash:
                 try:
-                    # Move old copy to a backup so we can restore on failure
+                    # Build the complete replacement privately while the old
+                    # skill remains visible. A gateway process may exit at any
+                    # time after readiness; copytree must never write directly
+                    # into the live destination and leave a partial skill that
+                    # the next sync mistakes for user-owned content.
                     backup = dest.with_suffix(".bak")
                     # A stale backup left by an earlier failure would make
                     # shutil.move() nest dest *inside* it (or fail outright)
                     # and would poison the restore path below. The current
                     # dest is the authoritative copy — clear the leftover.
                     if backup.exists():
-                        _rmtree_writable(backup)
-                    shutil.move(str(dest), str(backup))
+                        _retire_bundled_update_backup(dest, backup)
+                    else:
+                        _discard_bundled_promotion_receipt(dest)
+                    staged = _stage_bundled_skill_copy(skill_src, dest)
                     try:
-                        shutil.copytree(skill_src, dest)
+                        shutil.move(str(dest), str(backup))
+                        try:
+                            # Commit this receipt before publishing the staged
+                            # replacement. A crash after rename can then prove
+                            # exactly which bytes were promoted even if the
+                            # bundled source advances before restart.
+                            _write_bundled_promotion_receipt(
+                                dest,
+                                origin_hash=origin_hash,
+                                promoted_hash=bundled_hash,
+                            )
+                            _promote_staged_bundled_skill(staged, dest)
+                            staged = None
+                        except (OSError, IOError):
+                            # Promotion did not publish the replacement. The
+                            # old directory is still an intact, atomic backup.
+                            if not dest.exists() and backup.exists():
+                                shutil.move(str(backup), str(dest))
+                            _discard_bundled_promotion_receipt(dest)
+                            raise
                         manifest[skill_name] = bundled_hash
                         updated.append(skill_name)
                         if not quiet:
                             print(f"  ↑ {skill_name} (updated)")
-                        # Remove backup after successful copy
-                        try:
-                            _rmtree_writable(backup)
-                        except (OSError, IOError):
-                            logger.debug("Could not remove backup %s", backup, exc_info=True)
-                    except (OSError, IOError):
-                        # Restore from backup. A partially-written dest must
-                        # not shadow the user's copy or block the restore —
-                        # clear it first, then move the backup home.
-                        if backup.exists():
-                            if dest.exists():
-                                try:
-                                    _rmtree_writable(dest)
-                                except (OSError, IOError):
-                                    logger.warning(
-                                        "Could not clear partial copy %s during restore",
-                                        dest, exc_info=True,
-                                    )
-                            if not dest.exists():
-                                shutil.move(str(backup), str(dest))
-                        raise
+                        # Keep the backup as a durable interrupted-update
+                        # receipt until the manifest commit below succeeds.
+                        committed_backups.append((dest, backup))
+                    finally:
+                        _discard_staged_bundled_skill(staged)
                 except (OSError, IOError) as e:
                     if not quiet:
                         print(f"  ! Failed to update {skill_name}: {e}")
@@ -2905,7 +3798,23 @@ def sync_skills(quiet: bool = False) -> dict:
             except (OSError, IOError) as e:
                 logger.debug("Could not copy %s: %s", desc_md, e)
 
-    _write_manifest(manifest)
+    manifest_committed = _write_manifest(manifest)
+    if manifest_committed:
+        for dest, backup in committed_backups:
+            try:
+                _retire_bundled_update_backup(dest, backup)
+            except (OSError, IOError):
+                logger.debug("Could not remove committed backup %s", backup, exc_info=True)
+    elif committed_backups:
+        # The manifest is the transaction commit record.  A promoted skill
+        # whose new origin hash did not reach disk still needs its atomic
+        # ``.bak`` receipt so the next run can distinguish a completed
+        # promotion from user-owned content and recover safely.
+        logger.warning(
+            "Skills manifest commit failed; retaining %s update backup(s) "
+            "for recovery",
+            len(committed_backups),
+        )
     optional_provenance_backfilled = _backfill_optional_provenance(quiet=quiet)
 
     return {
