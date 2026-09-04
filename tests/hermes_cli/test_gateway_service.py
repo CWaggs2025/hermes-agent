@@ -22,6 +22,29 @@ from gateway.restart import (
 )
 
 
+class TestGatewayCommandDispatch:
+    def test_lifecycle_status_dispatch_does_not_sync_skills(self, monkeypatch):
+        """Read-only gateway commands must not touch configured skill roots."""
+        import hermes_cli.main as main_module
+
+        args = SimpleNamespace(gateway_command="status")
+        dispatched = []
+
+        def fail_if_synced():
+            raise AssertionError("gateway status attempted an implicit skill sync")
+
+        monkeypatch.setattr(
+            main_module, "_sync_bundled_skills_quietly", fail_if_synced
+        )
+        monkeypatch.setattr(
+            gateway_cli, "gateway_command", lambda received: dispatched.append(received)
+        )
+
+        main_module.cmd_gateway(args)
+
+        assert dispatched == [args]
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)

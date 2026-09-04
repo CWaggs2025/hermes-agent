@@ -2302,6 +2302,10 @@ DEFAULT_CONFIG = {
     # goes to ~/.hermes/skills/ unless create_dir (below) redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # External roots may be network mounts. Catalog discovery runs in a
+        # killable child process and retains the last successful snapshot if
+        # the mount stalls. Values are clamped to 1..10 seconds.
+        "external_scan_timeout_seconds": 10,
         # Where agent-created skills (skill_manage action=create) are written.
         # Empty = the profile-local skills dir (~/.hermes/skills/). When set,
         # new skills land here AND every agent-facing instruction that names

@@ -6,11 +6,16 @@ tool registration or provider resolution.
 """
 
 import ast
+import hashlib
+import json
 import logging
+import math
 import os
 import re
+import stat as stat_module
 import sys
-from pathlib import Path
+import threading
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
@@ -516,6 +521,497 @@ def _normalize_string_set(values) -> Set[str]:
 
 # ── External skills directories ──────────────────────────────────────────
 
+EXTERNAL_SKILLS_CATALOG_VERSION = 2
+EXTERNAL_SKILLS_SCAN_TIMEOUT_DEFAULT = 10.0
+EXTERNAL_SKILLS_SCAN_TIMEOUT_MIN = 1.0
+# Gateway/external-root work has one hard upper bound. A larger config value
+# must never lengthen startup or a post-readiness reconciliation past 10s.
+EXTERNAL_SKILLS_SCAN_TIMEOUT_MAX = 10.0
+EXTERNAL_SKILLS_MAX_CATALOG_NAMES = 20_000
+EXTERNAL_SKILLS_MAX_NAME_BYTES = 1024
+EXTERNAL_SKILLS_MAX_CATALOG_BYTES = 8 * 1024 * 1024
+_EXTERNAL_SKILLS_CATALOG_FILENAME = "external-skills-catalog.json"
+_EXTERNAL_SKILLS_SNAPSHOT_DIRNAME = "external-skills-snapshots"
+EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX = ".read-lease.lock"
+
+
+class _ExternalSnapshotReadLease:
+    """One process-local reference to a cross-process generation read lock."""
+
+    def __init__(self, key: str):
+        self._key = key
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _release_gateway_external_snapshot_lease(self._key)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            # Interpreter teardown may already have cleared module globals;
+            # the OS releases the advisory lock when the process exits.
+            pass
+
+
+class _LeasedSnapshotPath(type(Path())):
+    """Concrete ``Path`` retaining a read lease for its generation."""
+
+    __slots__ = ("_external_snapshot_lease",)
+
+    def __new__(cls, path: Path, lease: _ExternalSnapshotReadLease):
+        instance = super().__new__(cls, path)
+        instance._external_snapshot_lease = lease
+        return instance
+
+
+_GATEWAY_EXTERNAL_SNAPSHOT_LEASES: Dict[str, Tuple[Any, int]] = {}
+_GATEWAY_EXTERNAL_SNAPSHOT_LEASES_LOCK = threading.Lock()
+
+
+def _open_gateway_external_snapshot_lease(generation: Path):
+    """Acquire a shared, nonblocking lease on one local generation."""
+    parent_fd = -1
+    lease_fd = -1
+    handle = None
+    lease_name = f".{generation.name}{EXTERNAL_SKILLS_SNAPSHOT_READ_LOCK_SUFFIX}"
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        lease_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        supports_dir_fd = os.open in getattr(os, "supports_dir_fd", ())
+        if supports_dir_fd:
+            parent_fd = os.open(generation.parent, directory_flags)
+            lease_fd = os.open(
+                lease_name,
+                lease_flags,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        else:
+            if generation.is_symlink():
+                return None
+            lease_path = generation.parent / lease_name
+            try:
+                lease_stat = lease_path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                lease_stat = None
+            if lease_stat is not None and stat_module.S_ISLNK(lease_stat.st_mode):
+                return None
+            lease_fd = os.open(lease_path, lease_flags, 0o600)
+
+        metadata = os.fstat(lease_fd)
+        if not stat_module.S_ISREG(metadata.st_mode):
+            return None
+        handle = os.fdopen(lease_fd, "a+b")
+        lease_fd = -1
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\n")
+                handle.flush()
+            handle.seek(0)
+            # Windows' CRT exposes only an exclusive byte-range lock. The
+            # process-local registry below shares this one handle among all
+            # concurrent gateway readers in this process.
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return handle
+    except (BlockingIOError, OSError, PermissionError):
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        return None
+    finally:
+        if lease_fd >= 0:
+            os.close(lease_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _close_gateway_external_snapshot_lease(handle) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, PermissionError, ValueError):
+        pass
+    finally:
+        try:
+            handle.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _acquire_gateway_external_snapshot_lease(
+    generation: Path,
+) -> Optional[_ExternalSnapshotReadLease]:
+    key = os.path.normcase(os.path.abspath(str(generation)))
+    with _GATEWAY_EXTERNAL_SNAPSHOT_LEASES_LOCK:
+        existing = _GATEWAY_EXTERNAL_SNAPSHOT_LEASES.get(key)
+        if existing is not None:
+            handle, references = existing
+            _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (handle, references + 1)
+            return _ExternalSnapshotReadLease(key)
+        handle = _open_gateway_external_snapshot_lease(generation)
+        if handle is None:
+            return None
+        _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (handle, 1)
+        return _ExternalSnapshotReadLease(key)
+
+
+def _release_gateway_external_snapshot_lease(key: str) -> None:
+    handle = None
+    with _GATEWAY_EXTERNAL_SNAPSHOT_LEASES_LOCK:
+        existing = _GATEWAY_EXTERNAL_SNAPSHOT_LEASES.get(key)
+        if existing is None:
+            return
+        candidate, references = existing
+        if references > 1:
+            _GATEWAY_EXTERNAL_SNAPSHOT_LEASES[key] = (
+                candidate,
+                references - 1,
+            )
+            return
+        handle = candidate
+        _GATEWAY_EXTERNAL_SNAPSHOT_LEASES.pop(key, None)
+    _close_gateway_external_snapshot_lease(handle)
+
+
+def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
+    """Read one local regular file without following a final symlink or FIFO.
+
+    Gateway startup uses this for its profile-local catalog pointer.  Opening
+    with ``O_NONBLOCK`` before validating the descriptor is deliberate: a
+    planted FIFO must fail closed instead of restoring the same unbounded
+    startup wait that the external-root subprocess boundary removes.
+    """
+    path = Path(path)
+    parent_fd = -1
+    file_fd = -1
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        supports_dir_fd = os.open in getattr(os, "supports_dir_fd", ())
+        if supports_dir_fd:
+            parent_fd = os.open(path.parent, directory_flags)
+            parent_stat = os.fstat(parent_fd)
+            if not stat_module.S_ISDIR(parent_stat.st_mode):
+                raise OSError(f"catalog parent is not a directory: {path.parent}")
+            file_fd = os.open(path.name, file_flags, dir_fd=parent_fd)
+        else:
+            # Windows does not expose dir-relative opens through ``os.open``.
+            # Reject an observed link before opening, then compare the opened
+            # file identity with the no-follow metadata below.
+            path_stat = path.stat(follow_symlinks=False)
+            if stat_module.S_ISLNK(path_stat.st_mode):
+                raise OSError(f"refusing to read symlink: {path}")
+            file_fd = os.open(path, file_flags)
+
+        opened_stat = os.fstat(file_fd)
+        if not stat_module.S_ISREG(opened_stat.st_mode):
+            raise OSError(f"refusing to read non-regular file: {path}")
+        if opened_stat.st_size > max_bytes:
+            raise OSError(f"bounded file exceeds {max_bytes} bytes: {path}")
+        if not supports_dir_fd and (
+            opened_stat.st_dev != path_stat.st_dev
+            or opened_stat.st_ino != path_stat.st_ino
+        ):
+            raise OSError(f"file changed while it was opened: {path}")
+
+        chunks: List[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            try:
+                chunk = os.read(file_fd, min(64 * 1024, remaining))
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > max_bytes:
+            raise OSError(f"bounded file exceeds {max_bytes} bytes: {path}")
+        return data
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def external_skills_catalog_path(hermes_home: Optional[Path] = None) -> Path:
+    """Return the profile-local external catalog pointer path."""
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    return Path(hermes_home) / "cache" / _EXTERNAL_SKILLS_CATALOG_FILENAME
+
+
+def external_skills_snapshot_dir(hermes_home: Optional[Path] = None) -> Path:
+    """Return the profile-local root for versioned materialized snapshots."""
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    return Path(hermes_home) / "cache" / _EXTERNAL_SKILLS_SNAPSHOT_DIRNAME
+
+
+def external_skills_roots_fingerprint(roots: Tuple[str, ...]) -> str:
+    """Stable identity for a lexical configured-root list."""
+    payload = json.dumps(list(roots), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_external_skills_scan_settings(
+    *,
+    hermes_home: Optional[Path] = None,
+    skills_dir: Optional[Path] = None,
+) -> Tuple[Tuple[str, ...], float]:
+    """Return lexical external roots and their hard-bounded scan timeout.
+
+    No operation in this resolver stats, resolves, or traverses a configured
+    external path. This is the single configuration boundary shared by the
+    foreground resolver, gateway snapshot resolver, and bundled-skill scanner.
+    """
+    parsed = _load_raw_config() or {}
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        skills_cfg = {}
+
+    try:
+        timeout = float(
+            skills_cfg.get(
+                "external_scan_timeout_seconds",
+                EXTERNAL_SKILLS_SCAN_TIMEOUT_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        timeout = EXTERNAL_SKILLS_SCAN_TIMEOUT_DEFAULT
+    if not math.isfinite(timeout):
+        timeout = EXTERNAL_SKILLS_SCAN_TIMEOUT_DEFAULT
+    timeout = max(
+        EXTERNAL_SKILLS_SCAN_TIMEOUT_MIN,
+        min(EXTERNAL_SKILLS_SCAN_TIMEOUT_MAX, timeout),
+    )
+
+    raw_value = skills_cfg.get("external_dirs")
+    if raw_value is not None and not isinstance(
+        raw_value, (str, list, tuple, set, frozenset)
+    ):
+        raise ValueError("skills.external_dirs must be a path or a list of paths")
+    raw_dirs = parse_config_string_list(raw_value)
+
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    if skills_dir is None:
+        skills_dir = get_skills_dir()
+    local_skills = os.path.normcase(
+        os.path.abspath(os.path.normpath(str(skills_dir)))
+    )
+    seen: Set[str] = set()
+    roots: List[str] = []
+    for entry in raw_dirs:
+        expanded = os.path.expanduser(os.path.expandvars(str(entry).strip()))
+        if not expanded:
+            continue
+        path = Path(expanded)
+        if not path.is_absolute():
+            path = Path(hermes_home) / path
+        # Lexical normalization only. Path.resolve()/is_dir() belong either
+        # to a foreground CLI process or the scanner child, never a gateway.
+        normalized = os.path.abspath(os.path.normpath(str(path)))
+        key = os.path.normcase(normalized)
+        if key == local_skills or key in seen:
+            continue
+        seen.add(key)
+        roots.append(normalized)
+    return tuple(roots), timeout
+
+
+def get_gateway_external_skills_snapshot(
+    roots: Tuple[str, ...],
+    *,
+    hermes_home: Optional[Path] = None,
+) -> Optional[Tuple[frozenset[str], Tuple[Path, ...]]]:
+    """Load a validated profile-local catalog and materialization for a gateway.
+
+    The function intentionally never opens, stats, resolves, or walks any
+    configured external root. Invalid, stale, incomplete, or absent local
+    metadata produces ``None``; live reconciliation can refresh the
+    versioned materialization later without delaying adapter readiness.
+    """
+    if not roots:
+        return frozenset(), ()
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    hermes_home = Path(hermes_home)
+    fingerprint = external_skills_roots_fingerprint(roots)
+    catalog_path = external_skills_catalog_path(hermes_home)
+    try:
+        # The catalog and snapshot parent must be real profile-local
+        # directories/files, not links that can redirect an unattended gateway
+        # onto another filesystem.  is_symlink() uses lstat and does not touch
+        # the target.
+        if catalog_path.parent.is_symlink() or catalog_path.is_symlink():
+            return None
+        catalog_bytes = _read_bounded_regular_file(
+            catalog_path,
+            EXTERNAL_SKILLS_MAX_CATALOG_BYTES,
+        )
+        payload = json.loads(catalog_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        payload.get("version") != EXTERNAL_SKILLS_CATALOG_VERSION
+        or payload.get("roots_fingerprint") != fingerprint
+        or payload.get("roots") != list(roots)
+        or payload.get("materialized_complete") is not True
+    ):
+        return None
+    names = payload.get("names")
+    if (
+        not isinstance(names, list)
+        or len(names) > EXTERNAL_SKILLS_MAX_CATALOG_NAMES
+        or any(
+            not isinstance(name, str)
+            or not name
+            or len(name.encode("utf-8")) > EXTERNAL_SKILLS_MAX_NAME_BYTES
+            for name in names
+        )
+    ):
+        return None
+
+    relative_roots = payload.get("materialized_roots")
+    if not isinstance(relative_roots, list) or len(relative_roots) != len(roots):
+        return None
+    snapshot_base = external_skills_snapshot_dir(hermes_home)
+    try:
+        if snapshot_base.is_symlink() or not snapshot_base.is_dir():
+            return None
+    except OSError:
+        return None
+
+    result: List[Path] = []
+    generation_relative: Optional[PurePosixPath] = None
+    for root_index, raw_relative in enumerate(relative_roots):
+        if not isinstance(raw_relative, str) or not raw_relative:
+            return None
+        relative = PurePosixPath(raw_relative)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) != 3
+            or relative.parts[0] != fingerprint
+            or relative.parts[2] != f"root-{root_index:04d}"
+            or any("\\" in part or "/" in part for part in relative.parts)
+        ):
+            return None
+        candidate_generation = PurePosixPath(*relative.parts[:2])
+        if generation_relative is None:
+            generation_relative = candidate_generation
+        elif candidate_generation != generation_relative:
+            return None
+        candidate = snapshot_base.joinpath(*relative.parts)
+        current = snapshot_base
+        try:
+            # Reject a local pointer that could redirect the gateway back onto
+            # an external filesystem. is_symlink() uses lstat and never follows
+            # the link target; is_dir() runs only after every component passes.
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    return None
+            if not candidate.is_dir():
+                return None
+        except OSError:
+            return None
+        result.append(candidate)
+
+    if generation_relative is None:
+        return None
+    generation = snapshot_base.joinpath(*generation_relative.parts)
+    lease = _acquire_gateway_external_snapshot_lease(generation)
+    if lease is None:
+        return None
+    try:
+        # The generation may have been retired after validation but before
+        # the shared lock was acquired. Revalidate under the lease; from this
+        # point a conforming GC cannot obtain its exclusive fence.
+        if generation.is_symlink() or not generation.is_dir():
+            lease.close()
+            return None
+        for candidate in result:
+            if candidate.is_symlink() or not candidate.is_dir():
+                lease.close()
+                return None
+    except OSError:
+        lease.close()
+        return None
+    leased_roots = tuple(_LeasedSnapshotPath(path, lease) for path in result)
+    return frozenset(names), leased_roots
+
+
+def _gateway_materialized_external_skills_dirs(
+    roots: Tuple[str, ...],
+    *,
+    hermes_home: Optional[Path] = None,
+) -> List[Path]:
+    """Return only validated local materialized roots for gateway discovery."""
+    snapshot = get_gateway_external_skills_snapshot(
+        roots,
+        hermes_home=hermes_home,
+    )
+    if snapshot is None:
+        return []
+    names, materialized_roots = snapshot
+    # A confirmed empty catalog intentionally exposes no roots.
+    return list(materialized_roots) if names else []
+
 # (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
 # mtime_ns so a config.yaml edit mid-run is picked up automatically;
 # otherwise every call would re-read + re-YAML-parse the 15KB config,
@@ -543,6 +1039,13 @@ def get_external_skills_dirs() -> List[Path]:
     parsing a non-trivial config dominates ``hermes`` cold-start time
     when the cache is absent.
     """
+    if os.environ.get("_HERMES_GATEWAY") == "1":
+        try:
+            roots, _timeout = get_external_skills_scan_settings()
+        except (OSError, ValueError, TypeError):
+            return []
+        return _gateway_materialized_external_skills_dirs(roots)
+
     config_path = get_config_path()
     if not config_path.exists():
         return []
@@ -561,44 +1064,21 @@ def get_external_skills_dirs() -> List[Path]:
             # Return a copy so callers can't mutate the cached list.
             return list(cached)
 
-    parsed = _load_raw_config()
-    if not parsed:
+    try:
+        raw_dirs, _timeout = get_external_skills_scan_settings()
+    except (OSError, ValueError, TypeError):
         return []
-
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return []
-
-    raw_dirs = skills_cfg.get("external_dirs")
     if not raw_dirs:
         result: List[Path] = []
         if cache_key is not None:
             _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
         return result
-    if isinstance(raw_dirs, str):
-        raw_dirs = [raw_dirs]
-    if not isinstance(raw_dirs, list):
-        return []
-
-    from hermes_constants import get_hermes_home
-
-    hermes_home = get_hermes_home()
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
     result = []
 
     for entry in raw_dirs:
-        entry = str(entry).strip()
-        if not entry:
-            continue
-        # Expand ~ and environment variables
-        expanded = os.path.expanduser(os.path.expandvars(entry))
-        p = Path(expanded)
-        # Resolve relative paths against HERMES_HOME, not cwd
-        if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
+        p = Path(entry).resolve()
         if p == local_skills:
             continue
         if p in seen:
@@ -1298,10 +1778,24 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     without any manual cleanup.
     """
     skills_dir_str = str(skills_dir)
+    # Foreground Hermes intentionally supports user-created local category
+    # symlinks. A gateway is different: it is long-lived and unattended, and
+    # its external tier is already an immutable materialization, so it must
+    # never follow a directory link during runtime discovery.
+    follow_directory_symlinks = os.environ.get("_HERMES_GATEWAY") != "1"
+    if not follow_directory_symlinks:
+        try:
+            if Path(skills_dir).is_symlink():
+                return
+        except OSError:
+            return
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+    for root, dirs, files in os.walk(
+        skills_dir_str,
+        followlinks=follow_directory_symlinks,
+    ):
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
@@ -1313,6 +1807,10 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+            and (
+                follow_directory_symlinks
+                or not os.path.islink(os.path.join(root, d))
+            )
         ]
         if filename in files:
             matches.append(os.path.join(root, filename))
