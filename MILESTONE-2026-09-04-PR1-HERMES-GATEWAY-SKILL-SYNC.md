@@ -31,10 +31,10 @@ No credentials, installed skills, live services, catalog roots, private traveler
 |---|---|---|
 | Changed and adjacent tests | Repository `scripts/run_tests.sh` wrapper over the 11 recorded suites at implementation tip `04d6ff4bbcd8216550e7cec9e8c82c145a44361b` | PASS — 493 passed, 1 skipped |
 | Static and syntax checks | Ruff, Python 3.11 compile, and `git diff --check` | PASS |
-| Independent review | Two source/test/documentation reviews of the implementation candidate | PASS — no P0/P1/P2 blocker |
-| Frozen implementation identity | Source/test/documentation diff excluding the live pointer: SHA-256 `34e5c0c7d6fb9971f7f46a53b3e185f21b4dbe677ba116dd73f318af52ea379f` | PASS |
-| Fork PR readback | Draft PR #1 opening pointer head `3c8a14a0149ba7fcacabd30f6d40d0877c7e7b8b`; base and merge-base `63279301bcbdc185c1b07b98a9312eb0c862f26d`; no checks reported | PASS for publication truth; not CI |
-| Tool health | GitHub authenticated; CodeGraph exact worktree uninitialized; GrepAI narrow query hit a stale unrelated index; Context7 unavailable; Calendar and Playwright not applicable | DEGRADED, with exact Git/test evidence authoritative |
+| Independent review | Two source/test reviews of the implementation candidate; later exact-head review found documentation/provenance corrections only | PASS for implementation; corrected organization-only head requires external readback |
+| Frozen implementation identity | Full base-to-implementation diff excluding the five organization-only pointer/relay files: SHA-256 `4bf444d06c91ff8a27839c9899d080dfb13f8c4d9b663672be0d5c29929b3d4f` | PASS |
+| Fork PR readback | Public GitHub API and advertised refs confirmed Draft PR #1 against base and merge-base `63279301bcbdc185c1b07b98a9312eb0c862f26d`; the exact overall head must be read externally after each organization-only update; no checks reported | PASS for read-only publication truth; not CI or authenticated mutation proof |
+| Tool health | Public GitHub API and advertised refs available; configured `gh` authentication invalid; CodeGraph exact worktree uninitialized; GrepAI narrow query hit a stale unrelated index; Context7 unavailable; Calendar and Playwright not applicable | DEGRADED, with exact Git/test evidence authoritative |
 
 ## Review and Chris acceptance
 
@@ -42,7 +42,7 @@ Chris accepted publication of the reviewed candidate as a review-only fork PR. C
 
 ## PR, merge, ancestry, CI, and deployment truth
 
-PR #1 is open, Draft, and was reported mergeable against fork `main@63279301bcbdc185c1b07b98a9312eb0c862f26d`. Its branch is four commits ahead and zero behind before this relay. GitHub reports no status checks; that is absence of CI, not a green build. No merge commit, deployment, installation, restart, or production ancestry claim exists.
+PR #1 is open, Draft, and was reported mergeable against fork `main@63279301bcbdc185c1b07b98a9312eb0c862f26d`. The reviewed implementation ends at `04d6ff4bbcd8216550e7cec9e8c82c145a44361b`; every later commit must change only the five authorized organization-only pointer/relay paths. GitHub reports no status checks; that is absence of CI, not a green build. No merge commit, deployment, installation, restart, or production ancestry claim exists.
 
 ## Known gaps and owner-only actions
 

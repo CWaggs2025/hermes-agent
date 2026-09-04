@@ -12,7 +12,7 @@ Read, in order:
 TOOL HEALTH BEFORE WORK:
 - CodeGraph must show nonzero files/nodes and answer one representative query; record DEGRADED if this worktree remains uninitialized.
 - GrepAI must answer one narrow query from an exact Hermes workspace; reject unrelated-index results.
-- Confirm GitHub authentication before PR, CI, or merge claims.
+- Record configured `gh` authentication as degraded until proven otherwise; public GitHub API and advertised refs may support read-only PR evidence, but never mutation authority.
 - Calendar is required only if schedule reconciliation enters scope.
 - Use Context7 only for current external-library/API facts; none is currently required.
 - Playwright is not required because this packet has no UI change.
@@ -37,8 +37,8 @@ DISCOVER:
 
 PROVE:
 - Reconcile the PR diff against base `63279301bcbdc185c1b07b98a9312eb0c862f26d` and implementation tip `04d6ff4bbcd8216550e7cec9e8c82c145a44361b`.
-- Confirm only the authorized organization relay changed after opening pointer head `3c8a14a0149ba7fcacabd30f6d40d0877c7e7b8b`.
-- Recheck the frozen implementation diff SHA-256 `34e5c0c7d6fb9971f7f46a53b3e185f21b4dbe677ba116dd73f318af52ea379f` and inspect the adversarial timeout/no-follow/lease tests.
+- Confirm every commit after `04d6ff4bbcd8216550e7cec9e8c82c145a44361b` changes only the five authorized organization-only pointer/relay paths.
+- Recheck the full base-to-implementation diff SHA-256 `4bf444d06c91ff8a27839c9899d080dfb13f8c4d9b663672be0d5c29929b3d4f` after excluding those five paths, and inspect the adversarial timeout/no-follow/lease tests. If useful, verify `34e5c0c7d6fb9971f7f46a53b3e185f21b4dbe677ba116dd73f318af52ea379f` only as the corrective `76f79f` to `04d6ff4` delta excluding `NEXT.md`.
 - Treat the empty GitHub status-check rollup as no CI, never as green CI.
 
 STOP:

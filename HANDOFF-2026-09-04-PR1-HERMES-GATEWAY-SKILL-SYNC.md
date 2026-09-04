@@ -7,10 +7,10 @@
 | Surface | Verified state and evidence |
 |---|---|
 | Repository/branch/worktree | `CWaggs2025/hermes-agent`; `codex/gateway-skill-sync-readiness-20260903`; `/Users/admin/Documents/ChatGPT/Hermes Agent Gateway Skill Sync`; implementation tip `04d6ff4bbcd8216550e7cec9e8c82c145a44361b` |
-| PR/merge/ancestry | Draft PR [#1](https://github.com/CWaggs2025/hermes-agent/pull/1) targets `main@63279301bcbdc185c1b07b98a9312eb0c862f26d`; authenticated opening readback was OPEN, Draft, MERGEABLE at pointer head `3c8a14a0149ba7fcacabd30f6d40d0877c7e7b8b`. The post-relay head is the documentation commit containing this file and must be read back; no merge exists. |
+| PR/merge/ancestry | Draft PR [#1](https://github.com/CWaggs2025/hermes-agent/pull/1) targets `main@63279301bcbdc185c1b07b98a9312eb0c862f26d`. Public GitHub API and advertised refs reported OPEN, Draft, and MERGEABLE; the exact overall head must be read externally after each organization-only update. No merge exists. |
 | CI/deployment | GitHub returned an empty status-check rollup. No CI success, merge, installation, restart, deployment, or production state is claimed. |
-| File claims/dirty tree | The active ledger claims the implementation paths, `NEXT.md`, and the four PR #1 relay paths. The tree was clean before this relay; only the five authorized documentation paths may differ until the relay commit is pushed. |
-| Tool health | CodeGraph DEGRADED: exact worktree uninitialized and representative queries failed. GrepAI DEGRADED: no exact workspace; narrow query returned unrelated Mission Control results. Context7 DEGRADED/N/A: unavailable and no current external API fact was used. GitHub PASS: authenticated PR/ref readback. Calendar N/A: no scheduling request. Playwright N/A: no UI change. |
+| File claims/dirty tree | The active ledger claims the implementation paths, `NEXT.md`, and the four PR #1 relay paths. The PR must retain exactly the 25 claimed paths, with a clean worktree and matching local, fork, and PR refs before any decision. |
+| Tool health | CodeGraph DEGRADED: exact worktree uninitialized and representative queries failed. GrepAI DEGRADED: no exact workspace; narrow query returned unrelated Mission Control results. Context7 DEGRADED/N/A: unavailable and no current external API fact was used. GitHub read-only PASS via public API and advertised refs; configured `gh` authentication DEGRADED and no authenticated mutation proof exists. Calendar N/A: no scheduling request. Playwright N/A: no UI change. |
 
 ## 1. Completed in this milestone
 
@@ -28,7 +28,7 @@
 
 ## 3. Verification and negative tests
 
-The implementation tip passed the repository wrapper across 11 changed/adjacent suites: 493 passed, 1 skipped. Adversarial cases include hung scans, terminate/kill escalation, directory/link substitution, post-yield catalog swaps, stale identifiers, mutation attempts, unsupported path primitives, and sandbox export omission. Ruff, Python 3.11 compile, and `git diff --check` passed. Two independent reviews found no P0/P1/P2 blocker. Frozen implementation diff SHA-256: `34e5c0c7d6fb9971f7f46a53b3e185f21b4dbe677ba116dd73f318af52ea379f`.
+The implementation tip passed the repository wrapper across 11 changed/adjacent suites: 493 passed, 1 skipped. Adversarial cases include hung scans, terminate/kill escalation, directory/link substitution, post-yield catalog swaps, stale identifiers, mutation attempts, unsupported path primitives, and sandbox export omission. Ruff, Python 3.11 compile, and `git diff --check` passed. Two independent reviews found no P0/P1/P2 implementation blocker. The full base-to-implementation diff excluding the five organization-only pointer/relay paths has SHA-256 `4bf444d06c91ff8a27839c9899d080dfb13f8c4d9b663672be0d5c29929b3d4f`; `34e5c0c7d6fb9971f7f46a53b3e185f21b4dbe677ba116dd73f318af52ea379f` is only the corrective `76f79f` to `04d6ff4` delta excluding `NEXT.md`.
 
 ## 4. Incomplete work, blockers, and honest uncertainty
 
@@ -47,7 +47,7 @@ Chris must separately authorize any ready-for-review transition, merge, upstream
 
 ## 7. Exact resume point, files, contracts, and first safe action
 
-Resume in `/Users/admin/Documents/ChatGPT/Hermes Agent Gateway Skill Sync` on `codex/gateway-skill-sync-readiness-20260903`. Read `AGENTS.md`, `NEXT.md`, `HANDOFF-LATEST.md`, and this handoff. First safe action: authenticated read-only `gh pr view 1 --repo CWaggs2025/hermes-agent` plus local/remote ref, worktree-cleanliness, changed-path, and diff-hygiene checks. Stop on any head/base/path/claim mismatch.
+Resume in `/Users/admin/Documents/ChatGPT/Hermes Agent Gateway Skill Sync` on `codex/gateway-skill-sync-readiness-20260903`. Read `AGENTS.md`, `NEXT.md`, `HANDOFF-LATEST.md`, and this handoff. First safe action: read the public GitHub PR API and advertised local/fork/PR refs, then verify worktree cleanliness, the exact 25-path claim, and diff hygiene. Treat configured `gh` authentication as degraded until separately proven; stop on any head/base/path/claim mismatch.
 
 ## 8. Progress-ledger, calendar, and Kanban delta
 
