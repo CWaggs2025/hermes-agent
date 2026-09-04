@@ -46,6 +46,7 @@ from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     extract_skill_description,
+    is_external_skills_snapshot_path,
     is_skill_description_truncated_for_prompt,
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT,
@@ -346,18 +347,63 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
+def _materialized_snapshot_write_guard(
+    name: str,
+    skill_dir: Path,
+    action: str,
+) -> Optional[Dict[str, Any]]:
+    """Refuse every write to a derived gateway materialization.
+
+    A gateway materialization is derived, local cache state. It must remain
+    read-only even for a foreground request: editing it would report success
+    without changing the authoritative external source, and the next
+    reconciliation would discard the edit.  This lexical check never resolves
+    or traverses the configured external root.
+    """
+    try:
+        materialized = is_external_skills_snapshot_path(skill_dir)
+    except Exception:
+        logger.warning(
+            "materialized snapshot guard lookup failed for %s", name, exc_info=True
+        )
+        return {
+            "success": False,
+            "error": (
+                f"Refusing {action} for skill '{name}': gateway snapshot "
+                "ownership could not be verified."
+            ),
+        }
+    if materialized:
+        return {
+            "success": False,
+            "error": (
+                f"Refusing {action} for skill '{name}': the skill is in a "
+                "read-only gateway materialized snapshot. Edit the "
+                "authoritative external skill in a foreground or separately "
+                "supervised process, then reconcile the snapshot."
+            ),
+        }
+    return None
+
+
 def _background_review_write_guard(
     name: str,
     skill_dir: Path,
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    """Refuse autonomous curator writes to externally owned skills.
+    """Refuse immutable-snapshot writes and unsafe curator targets.
 
-    Foreground agents may still perform user-directed edits to external,
-    bundled, or hub-installed skills. The background review fork is different:
+    External, bundled, or hub-installed skills remain writable by a
+    foreground, user-directed agent. The background review fork is different:
     it is autonomous lifecycle maintenance, so its write surface is restricted
     to local curator-owned sediment.
     """
+    materialized_guard = _materialized_snapshot_write_guard(
+        name, skill_dir, action
+    )
+    if materialized_guard:
+        return materialized_guard
+
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
@@ -1032,6 +1078,11 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
+    materialized_guard = _materialized_snapshot_write_guard(
+        name, skill_dir, "create"
+    )
+    if materialized_guard:
+        return materialized_guard
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write instructional documents with a readable mode while preserving

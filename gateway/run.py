@@ -33847,6 +33847,44 @@ def _looks_like_profile_conflict_from_cmdline(command: str, our_home) -> bool:
     return False
 
 
+def _start_post_readiness_skill_sync() -> threading.Thread:
+    """Start best-effort bundled-skill sync after the serving boundary.
+
+    The gateway mode of ``tools.skills_sync`` never scans operator-configured
+    external roots: it consumes a validated local materialization and defers
+    reconciliation to a separately supervised foreground sync. This daemon
+    thread also keeps the remaining local copy work off the event loop and out
+    of the gateway's readiness-critical path.
+    """
+
+    def _run() -> None:
+        try:
+            from tools.skills_sync import (
+                ExternalSkillIndexUnavailable,
+                sync_skills,
+            )
+        except Exception:
+            logger.warning(
+                "Post-readiness bundled skill sync could not be loaded",
+                exc_info=True,
+            )
+            return
+
+        try:
+            sync_skills(quiet=True)
+        except ExternalSkillIndexUnavailable as exc:
+            logger.warning("Post-readiness bundled skill sync deferred: %s", exc)
+        except Exception:
+            logger.warning("Post-readiness bundled skill sync failed", exc_info=True)
+
+    thread = threading.Thread(
+        target=_run,
+        daemon=True,
+        name="gateway-skill-sync",
+    )
+    thread.start()
+    return thread
+
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
@@ -34062,13 +34100,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
             )
             return False
-
-    # Sync bundled skills on gateway start (fast -- skips unchanged)
-    try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
-    except Exception:
-        pass
 
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).
@@ -34570,6 +34601,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     start_watchdog = getattr(runner, "_start_systemd_watchdog", None)
     if callable(start_watchdog):
         start_watchdog()
+
+    # Preserve automatic gateway-launch seeding, but only after the gateway,
+    # cron scheduler, housekeeping, and systemd READY boundary are live. A
+    # stalled external filesystem can no longer block service readiness.
+    _start_post_readiness_skill_sync()
 
     # Wait for shutdown
     await runner.wait_for_shutdown()

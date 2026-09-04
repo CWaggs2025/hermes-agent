@@ -56,6 +56,56 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     return external_category
 
 
+def _make_guarded_gateway_skill(tmp_path: Path) -> tuple[Path, Path]:
+    """Create one descriptor-leased materialized external skill root."""
+    from agent import skill_utils
+    import tools.skills_sync as skills_sync
+
+    if not skill_utils._gateway_cache_dirfd_supported():
+        pytest.skip("descriptor-relative gateway cache access is unavailable")
+    hermes_home = tmp_path / "gateway-home"
+    roots = (str(tmp_path / "authoritative-external"),)
+    fingerprint = skills_sync._external_catalog_fingerprint(roots)
+    generation = (
+        hermes_home
+        / "cache"
+        / "external-skills-snapshots"
+        / fingerprint
+        / "1-aaaaaaaaaaaaaaaa"
+    )
+    skill_dir = _make_skill(
+        generation / "root-0000",
+        "gateway-safe",
+        body=(
+            "Directory: ${HERMES_SKILL_DIR}\n"
+            "Session: ${HERMES_SESSION_ID}\n"
+            "Inline: !`pwd`"
+        ),
+    )
+    references = skill_dir / "references"
+    references.mkdir()
+    (references / "info.md").write_text("PINNED LINK\n", encoding="utf-8")
+    with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+        skills_sync._write_external_snapshot_complete_marker(
+            generation,
+            fingerprint=fingerprint,
+            scan_id="1-aaaaaaaaaaaaaaaa",
+            materialized_bytes=256,
+        )
+        skills_sync._publish_external_catalog_snapshot(
+            fingerprint,
+            roots,
+            {"gateway-safe"},
+            (f"{fingerprint}/1-aaaaaaaaaaaaaaaa/root-0000",),
+        )
+    snapshot = skill_utils.get_gateway_external_skills_snapshot(
+        roots,
+        hermes_home=hermes_home,
+    )
+    assert snapshot is not None
+    return snapshot[1][0], hermes_home
+
+
 # ---------------------------------------------------------------------------
 # _parse_frontmatter
 # ---------------------------------------------------------------------------
@@ -180,6 +230,28 @@ class TestGetCategoryFromPath:
 
 
 class TestFindAllSkills:
+    def test_normal_scan_signature_uses_public_scandir(self, tmp_path):
+        """Ordinary roots do not depend on pathlib's private _scandir hook."""
+        _make_skill(tmp_path, "ordinary")
+        path_type = type(tmp_path)
+        private_scandir = getattr(path_type, "_scandir", None)
+        patcher = (
+            patch.object(
+                path_type,
+                "_scandir",
+                side_effect=AssertionError("private pathlib hook used"),
+            )
+            if private_scandir is not None
+            else patch.object(path_type, "_scandir", create=True)
+        )
+        with patcher:
+            signature = skills_tool_module._skills_scan_signature(
+                [tmp_path],
+                set(),
+            )
+
+        assert signature[0][0][0] == str(tmp_path)
+
     def test_finds_skills_and_skips_non_skill_trees(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a")
@@ -356,6 +428,81 @@ class TestSkillView:
             task_id="task-view",
             session_id="session-view",
         )
+
+    def test_guarded_gateway_view_never_serializes_or_reopens_cache_path(
+        self,
+        tmp_path,
+    ):
+        """Guarded views keep linked-file reads but disable plain-path users."""
+        guarded_root, _hermes_home = _make_guarded_gateway_skill(tmp_path)
+        local = tmp_path / "empty-local"
+        local.mkdir()
+
+        with patch("tools.skills_tool.SKILLS_DIR", local), patch(
+            "agent.skill_utils.get_project_skills_dirs",
+            return_value=[],
+        ), patch(
+            "agent.skill_utils.get_external_skills_dirs",
+            return_value=[guarded_root],
+        ), patch.dict(
+            os.environ,
+            {"_HERMES_GATEWAY": "1"},
+        ), patch(
+            "agent.skill_preprocessing.load_skills_config",
+            return_value={"template_vars": True, "inline_shell": True},
+        ), patch(
+            "agent.skill_preprocessing.run_inline_shell"
+        ) as inline_shell:
+            result = json.loads(
+                skill_view("gateway-safe", task_id="session-safe")
+            )
+            linked = json.loads(
+                skill_view("gateway-safe", file_path="references/info.md")
+            )
+
+        assert result["success"] is True
+        assert result["skill_dir"] is None
+        assert result["path_features_disabled"] is True
+        assert "_source_path" not in result
+        assert "${HERMES_SKILL_DIR}" in result["content"]
+        assert "session-safe" in result["content"]
+        assert "!`pwd`" in result["content"]
+        inline_shell.assert_not_called()
+        assert linked["content"] == "PINNED LINK\n"
+        assert linked["path_features_disabled"] is True
+        assert "_source_path" not in linked
+
+        # A successful view cannot seed the task dedup tracker with a plain
+        # cache path that later code would stat after a generation swap.
+        with patch("tools.skills_tool.os.stat") as bare_stat:
+            assert skills_tool_module._skill_view_fingerprint(result) is None
+        bare_stat.assert_not_called()
+
+    def test_guarded_gateway_collision_never_exports_snapshot_path(
+        self,
+        tmp_path,
+    ):
+        """Ambiguity diagnostics use a relative external display token."""
+        guarded_root, _hermes_home = _make_guarded_gateway_skill(tmp_path)
+        local = tmp_path / "local"
+        _make_skill(local, "gateway-safe", body="LOCAL COLLISION")
+
+        with patch("tools.skills_tool.SKILLS_DIR", local), patch(
+            "agent.skill_utils.get_project_skills_dirs",
+            return_value=[],
+        ), patch(
+            "agent.skill_utils.get_external_skills_dirs",
+            return_value=[guarded_root],
+        ), patch.dict(
+            os.environ,
+            {"_HERMES_GATEWAY": "1"},
+        ):
+            result = json.loads(skill_view("gateway-safe", preprocess=False))
+
+        assert result["success"] is False
+        assert "Ambiguous skill name" in result["error"]
+        assert str(guarded_root) not in json.dumps(result)
+        assert "external:gateway-safe/SKILL.md" in result["matches"]
 
 
     def test_view_reference_files(self, tmp_path):

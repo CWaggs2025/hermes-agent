@@ -3145,10 +3145,10 @@ def _pin_kanban_board_env() -> None:
 def _sync_bundled_skills_quietly() -> None:
     """Seed ``~/.hermes/skills/`` with the bundled skill library on first launch.
 
-    Called from any CLI entrypoint that the user might use as their first
-    interaction with Hermes — chat, dashboard (the desktop GUI's backend),
-    and gateway. The skills_sync module is manifest-based and idempotent:
-    skipped skills cost ~milliseconds, so calling this repeatedly is fine.
+    Called from interactive entrypoints that the user might use as their first
+    interaction with Hermes — chat and dashboard (the desktop GUI's backend).
+    Gateway lifecycle commands intentionally do not call this helper; the live
+    gateway schedules synchronization only after its serving boundary.
 
     Failures are swallowed because skills are an enhancement, not a hard
     dependency. Hermes still functions without them; the user just sees an
@@ -3547,8 +3547,6 @@ def cmd_chat(args):
 
 def cmd_gateway(args):
     """Gateway management commands."""
-    _sync_bundled_skills_quietly()
-
     from hermes_cli.gateway import gateway_command
 
     gateway_command(args)

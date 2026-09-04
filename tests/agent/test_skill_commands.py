@@ -1,7 +1,9 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -50,6 +52,56 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     return external_category
 
 
+def _make_guarded_gateway_skill(tmp_path: Path) -> Path:
+    """Create one descriptor-leased materialized external skill root."""
+    from agent import skill_utils
+    import tools.skills_sync as skills_sync
+
+    if not skill_utils._gateway_cache_dirfd_supported():
+        pytest.skip("descriptor-relative gateway cache access is unavailable")
+    hermes_home = tmp_path / "gateway-home"
+    roots = (str(tmp_path / "authoritative-external"),)
+    fingerprint = skills_sync._external_catalog_fingerprint(roots)
+    generation = (
+        hermes_home
+        / "cache"
+        / "external-skills-snapshots"
+        / fingerprint
+        / "1-bbbbbbbbbbbbbbbb"
+    )
+    skill_dir = _make_skill(
+        generation / "root-0000",
+        "gateway-command",
+        body=(
+            "Directory: ${HERMES_SKILL_DIR}\n"
+            "Session: ${HERMES_SESSION_ID}\n"
+            "Inline: !`pwd`"
+        ),
+    )
+    references = skill_dir / "references"
+    references.mkdir()
+    (references / "info.md").write_text("PINNED LINK\n", encoding="utf-8")
+    with patch("tools.skills_sync.HERMES_HOME", hermes_home):
+        skills_sync._write_external_snapshot_complete_marker(
+            generation,
+            fingerprint=fingerprint,
+            scan_id="1-bbbbbbbbbbbbbbbb",
+            materialized_bytes=256,
+        )
+        skills_sync._publish_external_catalog_snapshot(
+            fingerprint,
+            roots,
+            {"gateway-command"},
+            (f"{fingerprint}/1-bbbbbbbbbbbbbbbb/root-0000",),
+        )
+    snapshot = skill_utils.get_gateway_external_skills_snapshot(
+        roots,
+        hermes_home=hermes_home,
+    )
+    assert snapshot is not None
+    return snapshot[1][0]
+
+
 class TestScanSkillCommands:
 
 
@@ -57,6 +109,86 @@ class TestScanSkillCommands:
 
 
 
+
+    def test_ignores_incomplete_bundled_sync_staging(self, tmp_path):
+        """A process exit mid-copy must not expose private staging as a skill."""
+        _make_skill(tmp_path, "visible-skill")
+        _make_skill(
+            tmp_path / ".bundled-sync-staging",
+            "hidden-skill",
+            body="Partial staged content.",
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            commands = scan_skill_commands()
+
+        assert "/visible-skill" in commands
+        assert "/hidden-skill" not in commands
+
+    def test_gateway_prunes_python311_windows_reparse_category(self, tmp_path):
+        """Gateway walking treats the Windows reparse bit like a junction."""
+        from agent.skill_utils import iter_skill_index_files
+
+        category = tmp_path / "reparse-category"
+        _make_skill(category, "must-not-load")
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+        from agent import skill_utils
+
+        real_redirect_check = skill_utils.path_entry_is_redirect
+        real_scandir = os.scandir
+
+        def mocked_redirect(path, *, metadata=None):
+            if Path(path) == category:
+                metadata = reparse_metadata
+            return real_redirect_check(path, metadata=metadata)
+
+        def bounded_scandir(path):
+            assert Path(path) != category
+            return real_scandir(path)
+
+        with patch.dict(os.environ, {"_HERMES_GATEWAY": "1"}), patch(
+            "agent.skill_utils.path_entry_is_redirect",
+            side_effect=mocked_redirect,
+        ), patch(
+            "agent.skill_utils.os.scandir",
+            side_effect=bounded_scandir,
+        ):
+            found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
+
+        assert found == []
+
+    def test_gateway_bounded_reader_refuses_python311_windows_reparse_parent(
+        self,
+        tmp_path,
+    ):
+        """Catalog reads stop at a reparse entry without opening its target."""
+        from agent.skill_utils import _read_bounded_regular_file
+
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        catalog = cache / "catalog.json"
+        catalog.write_text("{}")
+        real_stat = Path.stat
+        reparse_metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+
+        def mocked_stat(path, *args, **kwargs):
+            if Path(path) == cache and kwargs.get("follow_symlinks") is False:
+                return reparse_metadata
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", mocked_stat), patch(
+            "agent.skill_utils.os.open",
+            side_effect=AssertionError("reader opened through reparse parent"),
+        ) as open_file, pytest.raises(OSError, match="redirected parent"):
+            _read_bounded_regular_file(catalog, 1024)
+
+        open_file.assert_not_called()
 
     def test_loads_skill_invocation_from_symlinked_skill_dir(self, tmp_path):
         """Slash commands should load skills symlinked under the local skills dir."""
@@ -254,6 +386,155 @@ class TestScanSkillCommands:
 
             assert "/b-only" in profile_b_commands
             assert "/a-only" not in profile_b_commands
+
+    def test_gateway_rescans_when_external_snapshot_generation_changes(self, tmp_path):
+        """A published generation must invalidate cached absolute skill paths.
+
+        Gateway external discovery returns versioned local materializations.
+        Retaining the prior generation in the slash-command cache either
+        hides the command during menu filtering or makes invocation resolve a
+        retired path after the snapshot pointer advances.
+        """
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+
+        local = tmp_path / "local"
+        generation_one = tmp_path / "snapshots" / "generation-one" / "root-0000"
+        generation_two = tmp_path / "snapshots" / "generation-two" / "root-0000"
+        local.mkdir()
+        _make_skill(generation_one, "first-external", body="First generation body.")
+        _make_skill(generation_two, "second-external", body="Second generation body.")
+        active_generation = [generation_one]
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                side_effect=lambda: [active_generation[0]],
+            ),
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_home", None),
+            patch.object(sc_mod, "_skill_commands_external_identity", None),
+            patch.dict(os.environ, {"_HERMES_GATEWAY": "1"}),
+        ):
+            first_commands = dict(get_skill_commands())
+            assert "/first-external" in first_commands
+            assert "/second-external" not in first_commands
+
+            active_generation[0] = generation_two
+            second_commands = dict(get_skill_commands())
+            message = build_skill_invocation_message("/second-external")
+
+        assert "/second-external" in second_commands
+        assert "/first-external" not in second_commands
+        assert second_commands["/second-external"]["skill_dir"].startswith(
+            str(generation_two)
+        )
+        assert message is not None
+        assert "Second generation body." in message
+
+    def test_gateway_rejects_stale_absolute_snapshot_identifier_without_resolve(
+        self,
+        tmp_path,
+    ):
+        """Legacy bindings cannot reopen a retired generation by pathname."""
+        from agent.skill_commands import _load_skill_payload
+
+        current_root = tmp_path / "cache" / "generation-two" / "root-0000"
+        stale = tmp_path / "cache" / "generation-one" / "root-0000" / "skill"
+        local = tmp_path / "local"
+        local.mkdir()
+
+        with patch("tools.skills_tool.SKILLS_DIR", local), patch(
+            "agent.skill_utils.get_project_skills_dirs",
+            return_value=[],
+        ), patch(
+            "agent.skill_utils.get_external_skills_dirs",
+            return_value=[current_root],
+        ), patch.dict(
+            os.environ,
+            {"_HERMES_GATEWAY": "1"},
+        ), patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("stale cache path was resolved"),
+        ) as path_resolve:
+            assert _load_skill_payload(str(stale)) is None
+
+        path_resolve.assert_not_called()
+
+    def test_guarded_gateway_command_disables_all_plain_path_features(
+        self,
+        tmp_path,
+    ):
+        """Slash activation never reconstructs or emits a snapshot cache path."""
+        import agent.skill_commands as sc_mod
+        from agent import skill_utils
+        from agent.skill_commands import get_skill_commands
+
+        guarded_root = _make_guarded_gateway_skill(tmp_path)
+        local = tmp_path / "empty-local"
+        local.mkdir()
+        real_normalize = skill_utils.normalize_skill_lookup_name
+        with patch("tools.skills_tool.SKILLS_DIR", local), patch(
+            "agent.skill_utils.get_project_skills_dirs",
+            return_value=[],
+        ), patch(
+            "agent.skill_utils.get_external_skills_dirs",
+            return_value=[guarded_root],
+        ), patch.object(
+            sc_mod,
+            "_skill_commands",
+            {},
+        ), patch.object(
+            sc_mod,
+            "_skill_commands_platform",
+            None,
+        ), patch.object(
+            sc_mod,
+            "_skill_commands_home",
+            None,
+        ), patch.object(
+            sc_mod,
+            "_skill_commands_external_identity",
+            None,
+        ), patch.dict(
+            os.environ,
+            {"_HERMES_GATEWAY": "1"},
+        ), patch(
+            "agent.skill_commands._load_skills_config",
+            return_value={"template_vars": True, "inline_shell": True},
+        ), patch(
+            "agent.skill_commands._expand_inline_shell"
+        ) as inline_shell, patch(
+            "agent.skill_utils.normalize_skill_lookup_name",
+            wraps=real_normalize,
+        ) as normalize_lookup:
+            commands = get_skill_commands()
+            message = build_skill_invocation_message(
+                "/gateway-command",
+                task_id="session-safe",
+            )
+
+        assert "/gateway-command" in commands
+        assert (
+            commands["/gateway-command"]["lookup_identifier"]
+            == "gateway-command"
+        )
+        assert all(
+            not Path(call.args[0]).is_absolute()
+            for call in normalize_lookup.call_args_list
+        )
+        assert message is not None
+        assert "${HERMES_SKILL_DIR}" in message
+        assert "session-safe" in message
+        assert "!`pwd`" in message
+        assert str(guarded_root) not in message
+        assert "[Skill directory:" not in message
+        assert "Gateway snapshot note" in message
+        assert 'skill_view(name="gateway-command"' in message
+        inline_shell.assert_not_called()
 
     def test_get_skill_commands_scans_profile_skills_dir_not_frozen_import_dir(self, tmp_path):
         """Under a profile home override the scan must read <profile>/skills/,

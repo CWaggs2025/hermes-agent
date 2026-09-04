@@ -382,17 +382,26 @@ skills:
     - ~/.agents/skills
     - /home/shared/team-skills
     - ${SKILLS_REPO}/skills
+  external_scan_timeout_seconds: 10
 ```
 
 Paths support `~` expansion and `${VAR}` environment variable substitution.
+`external_scan_timeout_seconds` controls the external-catalog safety boundary
+used by bundled-skill synchronization. It defaults to 10 seconds and is
+clamped to 1–10 seconds.
 
 ### How it works
 
 - **Create locally, update in place**: New agent-created skills are written to `~/.hermes/skills/` (or `skills.create_dir` when configured — see below). Existing skills are modified where they are found, including skills under `external_dirs`, when the agent uses `skill_manage` actions such as `patch`, `edit`, `write_file`, `remove_file`, or `delete`.
 - **External dirs are not a write-protection boundary**: If an external skill directory is writable by the Hermes process, agent-managed skill updates can change files in that directory. Use filesystem permissions or a separate profile/toolset setup if shared external skills must stay read-only.
+- **Gateway materializations are read-only**: The gateway consumes validated, profile-local copies of external skills. Those derived snapshot files cannot be changed with `skill_manage`; edit the authoritative external directory from a foreground or separately supervised process and reconcile a new snapshot instead.
+- **Gateway snapshot paths are never exported**: Gateway external skill text and linked files remain available through `skill_view`, but absolute directory hints, `${HERMES_SKILL_DIR}` expansion, inline-shell preprocessing, direct script execution, and sandbox mount/upload are disabled for materialized snapshots. Backend APIs retain plain paths without a safe snapshot lease, so Hermes fails closed instead of handing them a cache path that could be replaced after validation.
 - **Local precedence**: If the same skill name exists in both the local dir and an external dir, the local version wins.
-- **Full integration**: External skills appear in the system prompt index, `skills_list`, `skill_view`, and as `/skill-name` slash commands — no different from local skills.
-- **Non-existent paths are silently skipped**: If a configured directory doesn't exist, Hermes ignores it without errors. Useful for optional shared directories that may not be present on every machine.
+- **Integrated discovery**: External skills appear in the system prompt index, `skills_list`, `skill_view`, and as `/skill-name` slash commands. Foreground external skills otherwise behave like local skills; gateway materializations retain the path-feature and sandbox-export limits above.
+- **Unavailable paths do not block gateway readiness**: Gateway lifecycle and status commands never scan skill roots. Gateway runtime discovery never resolves or traverses configured external roots; it reads only a validated profile-local materialized snapshot, or no external skills when no valid snapshot exists. On gateway launch, the local-only synchronization attempt starts only after adapters, cron, housekeeping, and the service readiness signal are live. If external directories are configured, gateway mode defers reconciliation to a separately supervised foreground sync and never launches the external scanner.
+- **Failed catalog scans fail safe**: Foreground or separately supervised bundled-skill synchronization scans and materializes external roots in a killable child process, does not follow directory symlinks, and atomically retains the last successful catalog pointer. A stale last-known-good snapshot remains available to the gateway, but bundled reconciliation is deferred without changing local skills. A transition from a non-empty catalog to empty requires two independent successful scans. Repeated failures use bounded backoff. The local materialization cache is capped at four complete generations and 1 GiB of copied source content; the current generation, its immediate predecessor, and any actively leased gateway generation are never deleted. If a full new-generation slot cannot be reserved safely, synchronization defers before scanning or changing the catalog.
+- **Race-safe scanning is required**: External catalog reconciliation currently requires descriptor-relative directory traversal (available on supported POSIX runtimes). Platforms that cannot provide that primitive, including Windows, defer the optional reconciliation instead of falling back to a path walk that could follow a directory link during a rename race. Gateway materialized-snapshot consumption currently uses a Python 3.11-only descriptor-backed path capability; Python 3.12/3.13 gateways fail closed with no external snapshot until the newer pathlib traversal implementation is supported. Gateway startup and locally installed skills remain available.
+- **Runtime discovery skips non-existent paths**: Outside bundled-skill reconciliation, a configured directory that doesn't exist is ignored. Remove paths that are not intended to return; a temporarily unavailable shared mount is preserved by the reconciliation safeguards above.
 
 ### Example
 

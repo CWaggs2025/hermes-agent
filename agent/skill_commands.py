@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
-# Guards the (map, platform-tag, home-tag) triple so publication and the
-# freshness lookup always see a consistent snapshot. Scanning itself stays
-# outside this lock.
+_skill_commands_external_identity: Optional[tuple[str, ...]] = None
+# Guards the (map, platform-tag, home-tag, external-generation-tag) tuple so
+# publication and the freshness lookup always see a consistent snapshot.
+# Scanning itself stays outside this lock.
 _publish_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
@@ -229,6 +230,28 @@ def _resolve_skill_commands_home() -> str:
     return str(get_hermes_home())
 
 
+def _resolve_skill_commands_external_identity() -> Optional[tuple[str, ...]]:
+    """Return the gateway's current local external-snapshot identity.
+
+    Foreground Hermes keeps the historical config/home cache semantics.  A
+    gateway, however, consumes versioned materialized generations whose paths
+    change whenever the separately supervised reconciler publishes a new
+    catalog.  Those local generation paths are safe to inspect here and keep a
+    process-global slash-command cache from retaining paths into a retired
+    generation.  No configured external root is resolved or traversed.
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return None
+    try:
+        from agent.skill_utils import get_external_skills_dirs
+
+        return tuple(str(path) for path in get_external_skills_dirs())
+    except Exception:
+        # Match discovery's fail-closed behavior.  When a valid snapshot later
+        # appears, its non-empty generation identity forces a rescan.
+        return ()
+
+
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -260,7 +283,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     abs_skill_dir = loaded_skill.get("skill_dir")
     if abs_skill_dir:
         skill_dir = Path(abs_skill_dir)
-    elif skill_path:
+    elif skill_path and not loaded_skill.get("path_features_disabled"):
         try:
             skill_dir = _skills_dir() / Path(skill_path).parent
         except Exception:
@@ -320,16 +343,18 @@ def _build_skill_message(
     from tools.skills_tool import _skills_dir
 
     content = str(loaded_skill.get("content") or "")
+    path_features_disabled = bool(loaded_skill.get("path_features_disabled"))
+    processing_dir = None if path_features_disabled else skill_dir
 
     # ── Template substitution and inline-shell expansion ──
     # Done before anything else so downstream blocks (setup notes,
     # supporting-file hints) see the expanded content.
     skills_cfg = _load_skills_config()
     if skills_cfg.get("template_vars", True):
-        content = _substitute_template_vars(content, skill_dir, session_id)
-    if skills_cfg.get("inline_shell", False):
+        content = _substitute_template_vars(content, processing_dir, session_id)
+    if skills_cfg.get("inline_shell", False) and not path_features_disabled:
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
-        content = _expand_inline_shell(content, skill_dir, timeout)
+        content = _expand_inline_shell(content, processing_dir, timeout)
 
     parts = [activation_note, "", content.strip()]
 
@@ -402,6 +427,30 @@ def _build_skill_message(
             f'file_path="<path>"), or run scripts directly by absolute path '
             f"(e.g. `node {skill_dir}/scripts/foo.js`)."
         )
+    elif supporting:
+        parts.append("")
+        parts.append(
+            "[This gateway external skill has supporting files available "
+            "through skill_view:]"
+        )
+        for sf in supporting:
+            parts.append(f"- {sf}")
+        parts.append(
+            f'\nLoad any of these with skill_view(name="{loaded_skill.get("name")}", '
+            'file_path="<path>"). Absolute directory hints and direct script '
+            "execution are disabled for gateway external snapshots."
+        )
+
+    if path_features_disabled:
+        parts.extend(
+            [
+                "",
+                "[Gateway snapshot note: This external skill is available "
+                "through read-only skill_view calls. HERMES_SKILL_DIR "
+                "expansion, inline shell, absolute directory hints, and "
+                "direct script execution are disabled.]",
+            ]
+        )
 
     stable_prefix = None
     if user_instruction:
@@ -431,8 +480,12 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
+    global _skill_commands_external_identity
     platform = _resolve_skill_commands_platform()
     home = _resolve_skill_commands_home()
+    external_identity: Optional[tuple[str, ...]] = (
+        () if os.environ.get("_HERMES_GATEWAY") == "1" else None
+    )
     # Build into a local map and publish once, at the end. Writing straight
     # into the global made a scan's partial results visible to everything
     # else in the process: a second, overlapping scan deduped against its own
@@ -445,6 +498,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         from agent.skill_utils import (
             get_external_skills_dirs,
             get_project_skills_dirs,
+            is_gateway_materialized_snapshot_path,
             iter_project_skill_files,
             iter_skill_index_files,
         )
@@ -462,7 +516,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         skills_dir = _skills_dir()
         if skills_dir.exists():
             dirs_to_scan.append(skills_dir)
-        dirs_to_scan.extend(get_external_skills_dirs())
+        external_dirs = list(get_external_skills_dirs())
+        dirs_to_scan.extend(external_dirs)
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            external_identity = tuple(str(path) for path in external_dirs)
 
         for scan_dir in dirs_to_scan:
             _iter = (
@@ -530,11 +587,26 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                             name, cmd_key, commands[cmd_key]["name"],
                         )
                         continue
+                    guarded_snapshot = is_gateway_materialized_snapshot_path(
+                        skill_md
+                    )
+                    if guarded_snapshot:
+                        try:
+                            lookup_identifier = str(
+                                skill_md.parent.relative_to(scan_dir)
+                            )
+                        except ValueError:
+                            # A descriptor-derived result outside its scan root
+                            # is not a valid command candidate.
+                            continue
+                    else:
+                        lookup_identifier = str(skill_md.parent)
                     commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
+                        "lookup_identifier": lookup_identifier,
                     }
                 except Exception:
                     continue
@@ -551,6 +623,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         _skill_commands = commands
         _skill_commands_platform = platform
         _skill_commands_home = home
+        _skill_commands_external_identity = external_identity
     return commands
 
 
@@ -565,6 +638,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """
     current_platform = _resolve_skill_commands_platform()
     current_home = _resolve_skill_commands_home()
+    current_external_identity = _resolve_skill_commands_external_identity()
     # Read the map and its tags under the same lock that publishes them, so
     # the freshness decision is made against a consistent snapshot.
     with _publish_lock:
@@ -573,6 +647,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
             bool(commands)
             and _skill_commands_platform == current_platform
             and _skill_commands_home == current_home
+            and _skill_commands_external_identity == current_external_identity
         )
     if is_fresh:
         return commands
@@ -685,7 +760,10 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+    loaded = _load_skill_payload(
+        skill_info.get("lookup_identifier") or skill_info["skill_dir"],
+        task_id=task_id,
+    )
     if not loaded:
         return None
 
@@ -793,7 +871,10 @@ def build_stacked_skill_invocation_message(
             missing.append(cmd_key.lstrip("/"))
             continue
 
-        loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+        loaded = _load_skill_payload(
+            skill_info.get("lookup_identifier") or skill_info["skill_dir"],
+            task_id=task_id,
+        )
         if not loaded:
             missing.append(cmd_key.lstrip("/"))
             continue

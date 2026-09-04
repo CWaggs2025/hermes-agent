@@ -1293,16 +1293,23 @@ def discord_skill_commands_by_category(
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         from tools.skills_tool import SKILLS_DIR
 
-        _skills_dir = SKILLS_DIR.resolve()
-        _hub_dir = (SKILLS_DIR / ".hub").resolve()
-        # Build list of (resolved_root, is_local) tuples. Each external dir
+        def _lexical_absolute(path) -> _P:
+            return _P(os.path.abspath(os.path.normpath(str(path))))
+
+        _skills_dir = _lexical_absolute(SKILLS_DIR)
+        _hub_dir = _skills_dir / ".hub"
+        # Build a list of already-validated lexical roots. External gateway
+        # roots are capability-bearing Paths; wrapping them in Path.resolve()
+        # would discard that guard and could query a substituted cache
+        # ancestor merely while registering Discord commands.
+        # Each external dir
         # becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
         _scan_roots: list[_P] = [_skills_dir]
         try:
             for ext in get_external_skills_dirs():
                 try:
-                    _scan_roots.append(_P(ext).resolve())
+                    _scan_roots.append(_lexical_absolute(ext))
                 except Exception:
                     continue
         except Exception:
@@ -1310,7 +1317,7 @@ def discord_skill_commands_by_category(
         try:
             for proj in get_project_skills_dirs():
                 try:
-                    _scan_roots.append(_P(proj).resolve())
+                    _scan_roots.append(_lexical_absolute(proj))
                 except Exception:
                     continue
         except Exception:
@@ -1322,7 +1329,7 @@ def discord_skill_commands_by_category(
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            sp = _P(skill_path).resolve()
+            sp = _lexical_absolute(skill_path)
             # Hub skills are loaded via the skill hub, not surfaced as
             # slash commands.
             if str(sp).startswith(str(_hub_dir)):
